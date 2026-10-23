@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Daytrade Assist</title>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root {
+    --bg: #0a0d13; --panel: #11161f; --panel-2: #161c27; --line: #1f2735; --line-2: #2a3445;
+    --text: #d8dee9; --muted: #7c879b; --faint: #4d576a;
+    --up: #1fbf75; --up-soft: rgba(31,191,117,.14); --down: #f0485a; --down-soft: rgba(240,72,90,.14);
+    --warn: #f2a93b; --warn-soft: rgba(242,169,59,.14); --accent: #5b9dff; --accent-soft: rgba(91,157,255,.14);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  button { font: inherit; }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  header { display: flex; align-items: center; gap: 12px; padding: 9px 18px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5; flex-wrap: wrap; }
+  header h1 { font-size: 13px; letter-spacing: .08em; text-transform: uppercase; margin: 0 6px 0 0; font-weight: 700; }
+  .pill { padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; background: var(--panel-2); color: var(--muted); border: 1px solid var(--line-2); white-space: nowrap; }
+  .pill.live { color: var(--up); background: var(--up-soft); border-color: transparent; }
+  .pill.history { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
+  .spacer { flex: 1; }
+  .conn { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--down); flex: none; }
+  .dot.ok { background: var(--up); box-shadow: 0 0 0 3px var(--up-soft); }
+  .dot.warn { background: var(--warn); }
+
+  select { background: var(--panel-2); color: var(--text); border: 1px solid var(--line-2); border-radius: 6px; padding: 5px 8px; font: inherit; }
+  #assetSel { font-weight: 650; font-size: 14px; padding: 6px 10px; min-width: 190px; }
+  .seg { display: inline-flex; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 7px; padding: 2px; }
+  .seg button { background: none; border: 0; color: var(--muted); padding: 4px 9px; border-radius: 5px; cursor: pointer; font-weight: 600; font-size: 12px; }
+  .seg button:hover { color: var(--text); }
+  .seg button.on { background: var(--accent-soft); color: var(--accent); }
+  .bridge { display: flex; align-items: center; gap: 7px; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 7px; padding: 5px 10px; color: var(--text); cursor: pointer; font-size: 12px; font-weight: 600; }
+  .bridge:hover { border-color: var(--accent); }
+
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 14px; padding: 14px 18px; }
+  main > * { min-width: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  .card h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .09em; color: var(--muted); font-weight: 600; margin: 0 0 10px; }
+  .chart-card { padding: 10px 6px 4px 10px; position: relative; }
+  .chart-head { display: flex; gap: 16px; align-items: baseline; padding: 0 6px 6px 2px; color: var(--muted); flex-wrap: wrap; }
+  .chart-head .px { font-size: 18px; color: var(--text); }
+  #chart { height: 470px; }
+  .overlay { position: absolute; inset: 40px 10px 10px 10px; display: none; align-items: center; justify-content: center; text-align: center; color: var(--muted); background: rgba(10,13,19,.72); border-radius: 8px; z-index: 2; padding: 20px; }
+  .overlay.on { display: flex; }
+  .overlay b { color: var(--text); display: block; font-size: 15px; margin-bottom: 6px; }
+  aside { display: flex; flex-direction: column; gap: 14px; }
+  aside .card { padding: 14px 16px; }
+
+  .signal { text-align: center; padding: 8px 0 4px; }
+  .signal .dir { font-size: 34px; font-weight: 750; letter-spacing: .02em; line-height: 1.1; }
+  .signal .dir.call { color: var(--up); } .signal .dir.put { color: var(--down); } .signal .dir.hold { color: var(--muted); } .signal .dir.learn { color: var(--warn); font-size: 24px; }
+  .signal .sub { color: var(--muted); margin-top: 4px; min-height: 19px; }
+  .rule { margin-top: 12px; background: var(--panel-2); border-radius: 8px; padding: 9px 11px; text-align: left; }
+  .rule .name { font-weight: 600; }
+  .rule .meta { color: var(--muted); font-size: 12px; }
+  .countdown { margin-top: 12px; }
+  .countdown .bar { height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; }
+  .countdown .fill { height: 100%; background: var(--accent); width: 0; transition: width .25s linear; }
+  .countdown .lbl { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .headsup { margin-top: 10px; padding: 7px 10px; border-radius: 8px; background: var(--warn-soft); color: var(--warn); font-weight: 600; display: none; }
+  .ind { display: flex; justify-content: space-around; margin-top: 10px; color: var(--muted); font-size: 12px; }
+
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+  .stat .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  .stat .v { font-size: 17px; font-weight: 600; }
+  .up { color: var(--up); } .down { color: var(--down); } .muted { color: var(--muted); }
+  .wr { margin-top: 12px; }
+  .wr .track { position: relative; height: 8px; background: var(--line); border-radius: 4px; }
+  .wr .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; background: var(--accent); }
+  .wr .be { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--warn); }
+  .wr .lbl { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .note { color: var(--faint); font-size: 12px; margin-top: 10px; }
+
+  section.tabs { grid-column: 1 / -1; padding: 0; }
+  .tabbar { display: flex; gap: 2px; border-bottom: 1px solid var(--line); padding: 0 10px; overflow-x: auto; }
+  .tabbar button { background: none; border: 0; color: var(--muted); padding: 11px 14px; font-weight: 600; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap; }
+  .tabbar button.on { color: var(--text); border-bottom-color: var(--accent); }
+  .tabbar .count { color: var(--faint); font-weight: 500; margin-left: 4px; }
+  .pane { display: none; padding: 14px 16px 18px; }
+  .pane.on { display: block; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; padding: 6px 10px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); }
+  td { padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  tr:hover td { background: var(--panel-2); }
+  td.r, th.r { text-align: right; }
+  .scroll { max-height: 420px; overflow: auto; }
+  .tag { font-weight: 700; font-size: 11px; padding: 1px 7px; border-radius: 4px; }
+  .tag.CALL, .tag.WIN { color: var(--up); background: var(--up-soft); }
+  .tag.PUT, .tag.LOSS { color: var(--down); background: var(--down-soft); }
+  .tag.TIE { color: var(--warn); background: var(--warn-soft); }
+  .empty { color: var(--muted); padding: 24px; text-align: center; }
+
+  .hist-top { display: flex; gap: 12px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .hist-top label { color: var(--muted); display: flex; gap: 6px; align-items: center; }
+  .tiles { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .tile { background: var(--panel-2); border-radius: 8px; padding: 10px 12px; }
+  .tile .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  .tile .v { font-size: 18px; font-weight: 650; margin-top: 2px; }
+  .tile .s { color: var(--muted); font-size: 11px; }
+  #pnlChart { height: 220px; margin-bottom: 16px; }
+  .hist-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .hist-grid h3, .pane h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 6px; }
+  .mini { position: relative; height: 6px; width: 120px; background: var(--line); border-radius: 3px; display: inline-block; vertical-align: middle; }
+  .mini i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--faint); }
+  .mini i.q { background: var(--up); }
+  .mini b { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--warn); }
+
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line-2); border-radius: 12px; padding: 0; width: min(560px, calc(100vw - 32px)); }
+  dialog::backdrop { background: rgba(0,0,0,.55); }
+  .dlg-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--line); }
+  .dlg-head h2 { margin: 0; font-size: 15px; }
+  .dlg-body { padding: 14px 18px 18px; }
+  .dlg-body ol { padding-left: 20px; margin: 8px 0 14px; }
+  .dlg-body li { margin-bottom: 8px; }
+  .dlg-body code { font-family: var(--mono); background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .path { display: flex; gap: 8px; align-items: center; background: var(--panel-2); border-radius: 6px; padding: 7px 9px; margin-top: 6px; font-family: var(--mono); font-size: 11px; word-break: break-all; }
+  .btn { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 6px 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  .btn.ghost { background: var(--panel-2); color: var(--text); border: 1px solid var(--line-2); }
+  .x { background: none; border: 0; color: var(--muted); font-size: 20px; cursor: pointer; line-height: 1; }
+  .status-line { display: flex; gap: 8px; align-items: center; padding: 9px 11px; border-radius: 8px; background: var(--panel-2); margin-bottom: 12px; }
+  .fine { color: var(--faint); font-size: 12px; }
+
+  @media (max-width: 960px) {
+    main { grid-template-columns: 1fr; padding: 12px; }
+    header { padding: 9px 12px; gap: 8px; }
+    #assetSel { min-width: 150px; flex: 1 1 150px; }
+    #chart { height: 360px; }
+    .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .hist-grid { grid-template-columns: 1fr; }
+    .hist-grid > * { min-width: 0; }
+    .pane { padding: 12px 10px 14px; }
+    .hide-sm { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1 class="hide-sm">Daytrade Assist</h1>
+  <select id="assetSel" title="Currency pair"></select>
+  <div class="seg" id="tfSeg"></div>
+  <span class="pill" id="phase">connecting</span>
+  <span class="spacer"></span>
+  <button class="bridge" id="bridgeBtn"><span class="dot" id="bridgeDot"></span><span id="bridgeText">Connect Pocket Option</span></button>
+  <span class="conn hide-sm"><span class="dot" id="dot"></span><span id="connText">offline</span></span>
+</header>
+
+<main>
+  <div class="card chart-card">
+    <div class="chart-head">
+      <span class="px num" id="px">—</span>
+      <span id="ohlc" class="num"></span>
+      <span class="spacer"></span>
+      <span id="chartLbl">UTC</span>
+    </div>
+    <div id="chart"></div>
+    <div class="overlay" id="overlay"></div>
+  </div>
+
+  <aside>
+    <div class="card">
+      <h2 id="nextLbl">Next candle</h2>
+      <div class="signal">
+        <div class="dir hold" id="dir">—</div>
+        <div class="sub" id="dirSub"></div>
+      </div>
+      <div class="rule" id="ruleBox" style="display:none">
+        <div class="name" id="ruleName"></div>
+        <div class="meta num" id="ruleMeta"></div>
+      </div>
+      <div class="headsup" id="headsup"></div>
+      <div class="countdown" id="countdown" style="display:none">
+        <div class="bar"><div class="fill" id="cdFill"></div></div>
+        <div class="lbl"><span>candle closes in</span><span class="num" id="cdText"></span></div>
+      </div>
+      <div class="ind num" id="ind"></div>
+    </div>
+
+    <div class="card">
+      <h2>Paper account <span class="muted" id="acctLbl" style="text-transform:none;letter-spacing:0"></span></h2>
+      <div class="stats">
+        <div class="stat"><div class="k">Balance</div><div class="v num" id="bal">—</div></div>
+        <div class="stat"><div class="k">P&amp;L</div><div class="v num" id="pnl">—</div></div>
+        <div class="stat"><div class="k">W / L / T</div><div class="v num" id="wlt">—</div></div>
+        <div class="stat"><div class="k">Signals</div><div class="v num" id="sigs">—</div></div>
+      </div>
+      <div class="wr">
+        <div class="track"><div class="fill" id="wrFill"></div><div class="be" id="wrBe"></div></div>
+        <div class="lbl"><span>win rate <b class="num" id="wr">—</b></span><span>break-even <span class="num" id="be"></span></span></div>
+      </div>
+      <div class="note num" id="backtest"></div>
+      <div class="note num" id="lat"></div>
+    </div>
+  </aside>
+
+  <section class="card tabs">
+    <div class="tabbar">
+      <button data-tab="session" class="on">Session trades<span class="count" id="nSession"></span></button>
+      <button data-tab="history">History<span class="count" id="nHistory"></span></button>
+      <button data-tab="rules">Rules</button>
+    </div>
+
+    <div class="pane on" id="tab-session">
+      <div class="scroll"><table><thead><tr>
+        <th>Time</th><th>Pair</th><th>Side</th><th class="r">Entry</th><th class="r">Exit</th><th>Result</th><th class="r">P&amp;L</th><th>Rule</th>
+      </tr></thead><tbody id="sessionRows"></tbody></table></div>
+    </div>
+
+    <div class="pane" id="tab-history">
+      <div class="hist-top">
+        <label>Pair <select id="fAsset"></select></label>
+        <label>Timeframe <select id="fTf"></select></label>
+        <label>Feed <select id="fFeed"><option value="all">All</option><option value="feed">Live feeds</option><option value="demo">Demo</option></select></label>
+        <label>Period <select id="fPeriod">
+          <option value="all">All time</option><option value="1">Last 24 h</option><option value="7">Last 7 days</option><option value="session">This session</option>
+        </select></label>
+      </div>
+      <div class="tiles" id="tiles"></div>
+      <div id="pnlChart"></div>
+      <div class="hist-grid">
+        <div><h3>By day</h3><div class="scroll"><table><thead><tr>
+          <th>Day</th><th class="r">Trades</th><th class="r">W / L</th><th class="r">Win %</th><th class="r">P&amp;L</th>
+        </tr></thead><tbody id="dayRows"></tbody></table></div></div>
+        <div><h3>By pair &amp; timeframe</h3><div class="scroll"><table><thead><tr>
+          <th>Pair</th><th>TF</th><th class="r">Trades</th><th class="r">Win %</th><th class="r">P&amp;L</th>
+        </tr></thead><tbody id="pairRows"></tbody></table></div></div>
+      </div>
+      <h3 style="margin-top:16px">Trades</h3>
+      <div class="scroll"><table><thead><tr>
+        <th>Date / time</th><th>Pair</th><th>Side</th><th class="r">Entry</th><th class="r">Exit</th><th>Result</th><th class="r">P&amp;L</th><th>Rule</th>
+      </tr></thead><tbody id="histRows"></tbody></table></div>
+      <div class="note" id="journalPath"></div>
+    </div>
+
+    <div class="pane" id="tab-rules">
+      <div class="scroll"><table><thead><tr>
+        <th>Rule</th><th>Recent win rate</th><th class="r">Recent</th><th class="r">Lower bound</th><th class="r">Votes (recent)</th><th class="r">All-time</th><th class="r">All votes</th>
+      </tr></thead><tbody id="rulesRows"></tbody></table></div>
+      <div class="note">For the selected pair and timeframe. Green rules are tradeable now: their win rate's lower confidence bound is above break-even. Every vote is scored, traded or not. The best of 24 rules will look good partly by luck.</div>
+    </div>
+  </section>
+</main>
+
+<dialog id="connectDlg">
+  <div class="dlg-head"><h2>Connect Pocket Option</h2><button class="x" id="dlgClose" aria-label="Close">×</button></div>
+  <div class="dlg-body">
+    <div class="status-line"><span class="dot" id="dlgDot"></span><span id="dlgStatus"></span></div>
+    <p style="margin-top:0">A small Chrome extension forwards the prices your logged-in Pocket Option tab already receives to this app. It only reads prices: it never sees your password and never places trades.</p>
+    <ol>
+      <li>In Chrome, open <code>chrome://extensions</code> and turn on <b>Developer mode</b> (top right).</li>
+      <li>Click <b>Load unpacked</b> and choose this folder:
+        <div class="path"><span id="extPath" style="flex:1">—</span><button class="btn ghost" id="revealBtn">Show folder</button></div>
+      </li>
+      <li>Open Pocket Option (the demo account is fine), pick an OTC pair and leave the tab open. Reload the tab if it was already open.</li>
+      <li>The pair appears in the currency list here within a few seconds. Open more pairs in Pocket Option to add them.</li>
+    </ol>
+    <p class="fine">The extension's badge shows <b>ON</b> while prices reach the app. Keep this app running, since the extension sends to 127.0.0.1:8787. Pocket Option doesn't support third-party tools and may change its site at any time, which can stop the bridge working. This is for paper trading and research, not advice.</p>
+  </div>
+</dialog>
+
+<script>
+const $ = id => document.getElementById(id);
+const TIMEFRAMES = [15, 30, 60, 120, 300, 900];
+const S = { cfg: null, phase: 'connecting', asset: '', tf: 60, assets: [], bridge: { last: 0, ticks: 0 }, backtest: null,
+  candles: [], forming: null, trades: [], journal: [], rules: [], stats: {}, signal: null, open: null, preview: null, lastTs: 0, recvAt: 0 };
+
+const css = getComputedStyle(document.documentElement);
+const C = n => css.getPropertyValue(n).trim();
+const chartOpts = {
+  autoSize: true,
+  layout: { background: { type: 'solid', color: 'transparent' }, textColor: C('--muted'), fontSize: 11 },
+  grid: { vertLines: { color: '#161d29' }, horzLines: { color: '#161d29' } },
+  rightPriceScale: { borderColor: C('--line') },
+  timeScale: { borderColor: C('--line'), timeVisible: true, secondsVisible: false, rightOffset: 6 },
+  crosshair: { mode: 0 },
+};
+const chart = LightweightCharts.createChart($('chart'), chartOpts);
+const series = chart.addCandlestickSeries({
+  upColor: C('--up'), downColor: C('--down'), borderVisible: false, wickUpColor: C('--up'), wickDownColor: C('--down'),
+});
+let pnlChart = null, pnlSeries = null;
+
+const isDemo = a => a.startsWith('DEMO:');
+function pairName(a) {
+  if (!a) return '—';
+  let base = a.replace(/^DEMO:/, ''), otc = /_otc$/i.test(base);
+  base = base.replace(/_otc$/i, '');
+  if (/^[A-Z]{6}$/.test(base)) base = base.slice(0, 3) + '/' + base.slice(3);
+  return base + (otc ? ' OTC' : '') + (isDemo(a) ? ' · demo' : '');
+}
+const tfLabel = s => s % 3600 === 0 ? s / 3600 + 'h' : s % 60 === 0 ? s / 60 + 'm' : s + 's';
+const assetInfo = () => S.assets.find(a => a.name === S.asset);
+function digitsFor(price) { return price >= 20 ? 3 : 5; }
+const digits = () => digitsFor((assetInfo() || {}).price || (S.candles.length ? S.candles[S.candles.length - 1][4] : 1));
+const be = () => S.cfg ? 1 / (1 + S.cfg.payout) : 0.5405;
+const fmtPx = (x, d) => x == null ? '—' : x.toFixed(d ?? digits());
+const fmtMoney = x => (x >= 0 ? '+' : '−') + Math.abs(x).toFixed(2);
+const pct = x => x == null || !isFinite(x) ? '—' : (x * 100).toFixed(1) + '%';
+const clock = ms => new Date(ms).toISOString().slice(11, S.tf < 60 ? 19 : 16);
+const dayOf = ms => new Date(ms).toISOString().slice(0, 10);
+const bar = c => ({ time: c[0], open: c[1], high: c[2], low: c[3], close: c[4] });
+const esc = s => String(s ?? '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[ch]);
+function wilson(w, n, z) {
+  if (n <= 0) return 0;
+  const p = w / n, z2 = z * z;
+  return (p + z2 / (2 * n) - z * Math.sqrt(p * (1 - p) / n + z2 / (4 * n * n))) / (1 + z2 / n);
+}
+const fmtNs = ns => ns < 1000 ? ns + 'ns' : ns < 1e6 ? (ns / 1e3).toFixed(1) + 'µs' : (ns / 1e6).toFixed(2) + 'ms';
+function ago(ms) {
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  return s < 60 ? s.toFixed(0) + 's ago' : s < 3600 ? (s / 60).toFixed(0) + 'm ago' : s < 86400 ? (s / 3600).toFixed(0) + 'h ago' : (s / 86400).toFixed(0) + 'd ago';
+}
+
+// ---------- controls ----------
+$('tfSeg').innerHTML = TIMEFRAMES.map(s => `<button data-tf="${s}">${tfLabel(s)}</button>`).join('');
+$('tfSeg').addEventListener('click', e => { const b = e.target.closest('button'); if (b) select(S.asset, Number(b.dataset.tf)); });
+$('assetSel').addEventListener('change', e => select(e.target.value, S.tf));
+async function select(asset, tf) {
+  if (!asset) return;
+  S.phase = 'history'; renderHeader();
+  await fetch('/api/select', { method: 'POST', body: new URLSearchParams({ asset, tf }) }).catch(() => {});
+}
+
+let assetKey = '';
+function renderAssets() {
+  const now = Date.now();
+  const list = S.assets.filter(a => a.ticks > 0);
+  const live = list.filter(a => !isDemo(a.name) && now - a.last < 120000);
+  const saved = list.filter(a => !isDemo(a.name) && now - a.last >= 120000);
+  const demo = list.filter(a => isDemo(a.name));
+  const key = [live, saved, demo].map(g => g.map(a => a.name).join(',')).join('|') + '#' + S.asset;
+  if (key === assetKey) return;
+  assetKey = key;
+  const opt = a => `<option value="${esc(a.name)}"${a.name === S.asset ? ' selected' : ''}>${esc(pairName(a.name))}</option>`;
+  const group = (label, g) => g.length ? `<optgroup label="${label}">${g.map(opt).join('')}</optgroup>` : '';
+  const html = group('Pocket Option · live', live) + group('Saved · no live prices', saved) + group('Demo · simulated', demo);
+  $('assetSel').innerHTML = html || `<option value="">Waiting for prices…</option>`;
+  if (S.asset && !list.some(a => a.name === S.asset)) $('assetSel').insertAdjacentHTML('afterbegin', `<option selected>${esc(pairName(S.asset))}</option>`);
+}
+
+function renderHeader() {
+  document.querySelectorAll('#tfSeg button').forEach(b => b.classList.toggle('on', Number(b.dataset.tf) === S.tf));
+  const ph = $('phase');
+  ph.textContent = { live: 'live', history: 'learning…', ended: 'feed ended' }[S.phase] || S.phase;
+  ph.className = 'pill ' + (S.phase === 'live' ? 'live' : S.phase === 'history' ? 'history' : '');
+  $('nextLbl').textContent = `Next ${tfLabel(S.tf)} candle`;
+  $('chartLbl').textContent = `${pairName(S.asset)} · ${tfLabel(S.tf)} · UTC`;
+  $('acctLbl').textContent = S.asset ? `· ${pairName(S.asset)} ${tfLabel(S.tf)}` : '';
+  chart.applyOptions({ timeScale: { secondsVisible: S.tf < 60 } });
+  document.title = S.asset ? `${pairName(S.asset)} ${tfLabel(S.tf)} · Daytrade Assist` : 'Daytrade Assist';
+}
+
+function bridgeState() {
+  const age = Date.now() - S.bridge.last;
+  if (!S.bridge.last) return { cls: '', text: 'Connect Pocket Option', detail: 'Not connected yet. Follow the steps below.' };
+  if (age < 10000) return { cls: 'ok', text: 'Pocket Option', detail: `Receiving prices · ${S.bridge.ticks.toLocaleString()} ticks so far · last ${ago(S.bridge.last)}` };
+  return { cls: 'warn', text: 'Pocket Option · paused', detail: `No prices for ${ago(S.bridge.last).replace(' ago', '')}. Is a Pocket Option tab open?` };
+}
+function renderBridge() {
+  const st = bridgeState();
+  $('bridgeDot').className = 'dot ' + st.cls; $('bridgeText').textContent = st.text;
+  $('dlgDot').className = 'dot ' + st.cls; $('dlgStatus').textContent = st.detail;
+  $('extPath').textContent = S.cfg && S.cfg.extensionDir ? S.cfg.extensionDir : 'Run the app (not the CLI) to create the extension folder.';
+  $('revealBtn').style.display = S.cfg && S.cfg.extensionDir ? '' : 'none';
+}
+$('bridgeBtn').addEventListener('click', () => { renderBridge(); $('connectDlg').showModal(); });
+$('dlgClose').addEventListener('click', () => $('connectDlg').close());
+$('revealBtn').addEventListener('click', () => fetch('/api/reveal-extension', { method: 'POST' }).catch(() => {}));
+
+// ---------- stream ----------
+function connect() {
+  const es = new EventSource('/events');
+  es.onopen = () => { $('dot').classList.add('ok'); $('connText').textContent = 'connected'; };
+  es.onerror = () => { $('dot').classList.remove('ok'); $('connText').textContent = 'reconnecting'; };
+  es.onmessage = e => handle(JSON.parse(e.data));
+}
+
+function handle(m) {
+  switch (m.type) {
+    case 'snapshot':
+      Object.assign(S, { cfg: m.config, phase: m.phase, asset: m.asset, tf: m.tf, assets: m.assets, bridge: m.bridge, backtest: m.backtest,
+        candles: m.candles, trades: m.trades, journal: m.journal, rules: m.rules, stats: m.stats, signal: m.signal, open: m.open, preview: m.preview });
+      S.forming = m.forming ? m.forming.c : null;
+      if (m.forming) { S.lastTs = m.forming.ts; S.recvAt = Date.now(); }
+      assetKey = '';
+      series.applyOptions({ priceFormat: { type: 'price', precision: digits(), minMove: Math.pow(10, -digits()) } });
+      series.setData(allBars());
+      if (S.candles.length) chart.timeScale().scrollToRealTime();
+      renderAll();
+      break;
+    case 'forming':
+      S.forming = m.c; S.lastTs = m.ts; S.recvAt = Date.now();
+      safeUpdate(bar(m.c));
+      renderPrice();
+      break;
+    case 'closed':
+      pushCandle(m.c);
+      S.signal = m.signal; S.open = m.open; S.rules = m.rules; S.stats = m.stats; S.preview = null;
+      if (S.forming && S.forming[0] <= m.c[0]) S.forming = null;
+      safeUpdate(bar(m.c));
+      renderSignal(); renderAccount(); renderMarkers(); renderRules(); renderPrice(); renderOverlay();
+      break;
+    case 'settled':
+      S.trades.push(m.trade); S.stats = m.stats;
+      if (m.journaled) S.journal.push(m.trade);
+      renderAccount(); renderMarkers(); renderSession(); renderHistory();
+      break;
+    case 'preview':
+      S.preview = m.preview; renderSignal();
+      break;
+    case 'assets':
+      S.assets = m.assets; renderAssets(); renderOverlay();
+      break;
+    case 'bridge':
+      S.bridge = m.bridge; renderBridge();
+      break;
+  }
+}
+
+function pushCandle(c) {
+  const last = S.candles[S.candles.length - 1];
+  if (last && last[0] === c[0]) S.candles[S.candles.length - 1] = c; else S.candles.push(c);
+  if (S.candles.length > 3000) S.candles.shift();
+}
+function allBars() {
+  const bars = S.candles.map(bar);
+  if (S.forming && (!bars.length || S.forming[0] > bars[bars.length - 1].time)) bars.push(bar(S.forming));
+  return bars;
+}
+function safeUpdate(b) { try { series.update(b); } catch { series.setData(allBars()); } }
+
+// ---------- render ----------
+function renderAll() {
+  renderHeader(); renderAssets(); renderBridge(); renderOverlay();
+  renderPrice(); renderSignal(); renderAccount(); renderMarkers(); renderSession(); renderRules(); renderHistory();
+}
+
+function renderOverlay() {
+  const o = $('overlay');
+  let html = '';
+  if (!S.asset) html = `<div><b>Waiting for prices</b>Connect Pocket Option (button at the top right), or pick a demo pair from the list.</div>`;
+  else if (S.phase === 'history') html = `<div><b>Learning ${esc(pairName(S.asset))} on ${tfLabel(S.tf)}…</b>Replaying saved history.</div>`;
+  else if (!S.candles.length && !S.forming) html = `<div><b>Building the first ${tfLabel(S.tf)} candle</b>Prices for ${esc(pairName(S.asset))} will appear here.</div>`;
+  o.innerHTML = html; o.classList.toggle('on', !!html);
+}
+
+function renderPrice() {
+  const c = S.forming || S.candles[S.candles.length - 1];
+  if (!c) { $('px').textContent = '—'; $('ohlc').textContent = ''; return; }
+  $('px').textContent = fmtPx(c[4]);
+  $('ohlc').textContent = `O ${fmtPx(c[1])}  H ${fmtPx(c[2])}  L ${fmtPx(c[3])}`;
+}
+
+function renderSignal() {
+  const sig = S.signal, dir = $('dir'), sub = $('dirSub'), period = S.tf * 1000;
+  $('ruleBox').style.display = 'none';
+  if (S.phase === 'history') { dir.textContent = 'LEARNING'; dir.className = 'dir learn'; sub.textContent = 'replaying history for this pair and timeframe'; }
+  else if (!sig) { dir.textContent = '—'; dir.className = 'dir hold'; sub.textContent = S.asset ? `waiting for the next ${tfLabel(S.tf)} close` : 'no pair selected'; }
+  else if (sig.learning != null) {
+    dir.textContent = 'LEARNING'; dir.className = 'dir learn';
+    sub.textContent = `${Math.floor(sig.learning)} / ${S.cfg.minSamples} votes before the first trade`;
+  } else if (sig.side) {
+    dir.textContent = sig.side === 'CALL' ? 'CALL ▲' : 'PUT ▼';
+    dir.className = 'dir ' + sig.side.toLowerCase();
+    const start = sig.time + period;
+    sub.textContent = S.open ? `entry ${fmtPx(S.open.entry)} · ${clock(start)} → ${clock(start + period)}` : `candle ${clock(start)}`;
+  } else {
+    dir.textContent = 'HOLD'; dir.className = 'dir hold';
+    sub.textContent = 'no rule is clearly beating break-even';
+  }
+  if (sig && sig.best && sig.learning == null && S.phase !== 'history') {
+    $('ruleBox').style.display = '';
+    $('ruleName').textContent = (sig.side ? '' : 'best candidate: ') + sig.best.rule;
+    $('ruleMeta').textContent = `win ${pct(sig.best.rate)} · lower bound ${pct(sig.best.lower)} · n ${Math.round(sig.best.n)} · need > ${pct(be())}`;
+  }
+  $('ind').innerHTML = sig && S.phase !== 'history' ? `<span>RSI ${sig.rsi == null ? '—' : sig.rsi.toFixed(1)}</span><span>z ${sig.z == null ? '—' : (sig.z >= 0 ? '+' : '') + sig.z.toFixed(2)}</span><span>${sig.voting} rules voting</span>` : '';
+  const hu = $('headsup'), pv = S.preview;
+  if (pv && pv.signal.side && S.forming && pv.slot * S.tf === S.forming[0]) {
+    hu.style.display = 'block';
+    hu.textContent = `Heads-up: ${pv.signal.side} likely at ${clock((pv.slot + 1) * period)} · ${pv.signal.best ? pv.signal.best.rule : ''}`;
+  } else hu.style.display = 'none';
+}
+
+function tally(trades) {
+  let w = 0, l = 0, t = 0, pnl = 0;
+  for (const x of trades) { if (x.outcome === 'WIN') w++; else if (x.outcome === 'LOSS') l++; else t++; pnl += x.pnl; }
+  return { w, l, t, n: trades.length, pnl, rate: w + l ? w / (w + l) : null };
+}
+
+function renderAccount() {
+  if (!S.cfg) return;
+  const st = S.stats, t = tally(S.trades);
+  const pnl = st.balance - S.cfg.balance;
+  $('bal').textContent = st.balance.toFixed(2);
+  $('pnl').textContent = fmtMoney(pnl); $('pnl').className = 'v num ' + (pnl > 0 ? 'up' : pnl < 0 ? 'down' : '');
+  $('wlt').textContent = `${t.w} / ${t.l} / ${t.t}`;
+  $('sigs').textContent = st.candles ? `${st.signals} / ${st.candles}` : '—';
+  $('wr').textContent = pct(t.rate);
+  $('be').textContent = pct(be());
+  $('wrFill').style.width = ((t.rate ?? 0) * 100) + '%';
+  $('wrFill').style.background = t.rate == null ? 'var(--line)' : t.rate > be() ? 'var(--up)' : 'var(--down)';
+  $('wrBe').style.left = (be() * 100) + '%';
+  const b = S.backtest;
+  $('backtest').textContent = b && b.wins + b.losses + b.ties > 0
+    ? `On saved history (${b.candles} candles): ${b.wins + b.losses + b.ties} trades · ${pct(b.wins / Math.max(1, b.wins + b.losses))} · ${fmtMoney(b.pnl)}`
+    : '';
+  $('lat').textContent = st.candles ? `decision latency p50 ≤${fmtNs(st.p50)} · p99 ≤${fmtNs(st.p99)} · max ${fmtNs(st.max)}` : '';
+  $('nSession').textContent = S.trades.length || '';
+}
+
+function renderMarkers() {
+  const first = S.candles.length ? S.candles[0][0] : 0;
+  const marks = [];
+  for (const x of S.trades) {
+    const time = x.time / 1000;
+    if (time < first || x.asset !== S.asset || x.tf !== S.tf) continue;
+    const call = x.side === 'CALL';
+    marks.push({ time, position: call ? 'belowBar' : 'aboveBar', shape: call ? 'arrowUp' : 'arrowDown',
+      color: x.outcome === 'WIN' ? C('--up') : x.outcome === 'LOSS' ? C('--down') : C('--warn'), text: x.outcome === 'WIN' ? 'W' : x.outcome === 'LOSS' ? 'L' : 'T' });
+  }
+  if (S.open) {
+    const call = S.open.side === 'CALL';
+    marks.push({ time: S.open.time / 1000, position: call ? 'belowBar' : 'aboveBar', shape: call ? 'arrowUp' : 'arrowDown', color: C('--accent'), text: S.open.side });
+  }
+  marks.sort((a, b) => a.time - b.time);
+  series.setMarkers(marks);
+}
+
+function tradeRow(x, full) {
+  const d = new Date(x.time).toISOString();
+  const when = full ? d.slice(0, 16).replace('T', ' ') : d.slice(11, x.tf < 60 ? 19 : 16);
+  const dg = digitsFor(x.entry);
+  return `<tr><td class="num">${when}</td><td>${esc(pairName(x.asset))} <span class="muted">${tfLabel(x.tf || 60)}</span></td>
+    <td><span class="tag ${x.side}">${x.side}</span></td>
+    <td class="r num">${fmtPx(x.entry, dg)}</td><td class="r num">${fmtPx(x.exit, dg)}</td>
+    <td><span class="tag ${x.outcome}">${x.outcome}</span></td>
+    <td class="r num ${x.pnl > 0 ? 'up' : x.pnl < 0 ? 'down' : ''}">${fmtMoney(x.pnl)}</td>
+    <td class="muted">${esc(x.rule || '—')}</td></tr>`;
+}
+
+function renderSession() {
+  const rows = S.trades.slice(-500).reverse();
+  $('sessionRows').innerHTML = rows.length ? rows.map(x => tradeRow(x, false)).join('') :
+    `<tr><td colspan="8" class="empty">No trades yet for this pair and timeframe.</td></tr>`;
+}
+
+function renderRules() {
+  const z = S.cfg ? S.cfg.z : 1, min = S.cfg ? S.cfg.minSamples : 50;
+  const rows = S.rules.map(r => ({ ...r, recent: r.n > 0 ? r.w / r.n : null, lower: wilson(r.w, r.n, z), all: r.total ? r.wins / r.total : null }))
+    .sort((a, b) => (b.recent ?? -1) - (a.recent ?? -1));
+  $('rulesRows').innerHTML = rows.length ? rows.map(r => {
+    const q = r.n >= min && r.lower > be();
+    return `<tr><td style="${q ? 'color:var(--up);font-weight:600' : ''}">${esc(r.name)}</td>
+      <td><span class="mini"><i class="${q ? 'q' : ''}" style="width:${(r.recent ?? 0) * 100}%"></i><b style="left:${be() * 100}%"></b></span></td>
+      <td class="r num">${pct(r.recent)}</td><td class="r num">${r.n > 0 ? pct(r.lower) : '—'}</td>
+      <td class="r num">${Math.round(r.n)}</td><td class="r num">${pct(r.all)}</td><td class="r num">${r.total}</td></tr>`;
+  }).join('') : `<tr><td colspan="7" class="empty">No votes scored yet.</td></tr>`;
+}
+
+function fillSelect(sel, values, label, fmt) {
+  const cur = sel.value || 'all';
+  sel.innerHTML = `<option value="all">${label}</option>` + values.map(v => `<option value="${esc(v)}">${esc(fmt(v))}</option>`).join('');
+  sel.value = ['all', ...values.map(String)].includes(cur) ? cur : 'all';
+}
+
+function filteredJournal() {
+  const a = $('fAsset').value, tf = $('fTf').value, feed = $('fFeed').value, per = $('fPeriod').value, now = Date.now();
+  return S.journal.filter(x =>
+    (a === 'all' || x.asset === a) && (tf === 'all' || String(x.tf) === tf) &&
+    (feed === 'all' || (feed === 'demo') === isDemo(x.asset || '')) &&
+    (per === 'all' || (per === 'session' ? x.session === S.cfg.session : x.time >= now - Number(per) * 864e5)));
+}
+
+function renderHistory() {
+  fillSelect($('fAsset'), [...new Set(S.journal.map(x => x.asset).filter(Boolean))].sort(), 'All pairs', pairName);
+  fillSelect($('fTf'), [...new Set(S.journal.map(x => x.tf).filter(Boolean))].sort((a, b) => a - b), 'All', tfLabel);
+  $('nHistory').textContent = S.journal.length || '';
+  $('journalPath').textContent = S.cfg && S.cfg.journal ? 'Saved in ' + S.cfg.journal : '';
+
+  const list = filteredJournal().slice().sort((a, b) => a.time - b.time);
+  const t = tally(list);
+  let eq = 0, peak = 0, dd = 0, lastTime = 0;
+  const points = [];
+  for (const x of list) {
+    eq += x.pnl; peak = Math.max(peak, eq); dd = Math.max(dd, peak - eq);
+    let time = Math.floor(x.time / 1000); if (time <= lastTime) time = lastTime + 1; lastTime = time;
+    points.push({ time, value: +eq.toFixed(2) });
+  }
+  const staked = list.reduce((a, x) => a + (x.stake || 0), 0);
+  const days = groupBy(list, x => dayOf(x.time));
+  const pairs = groupBy(list, x => `${x.asset}|${x.tf}`);
+  const bestDay = [...days.entries()].map(([k, v]) => [k, tally(v).pnl]).sort((a, b) => b[1] - a[1])[0];
+  $('tiles').innerHTML = [
+    ['Trades', t.n, `${t.w}W · ${t.l}L · ${t.t}T`],
+    ['Win rate', pct(t.rate), `break-even ${pct(be())}`, t.rate == null ? '' : t.rate > be() ? 'up' : 'down'],
+    ['Net P&L', t.n ? fmtMoney(t.pnl) : '—', staked ? `${(t.pnl / staked * 100).toFixed(1)}% of staked` : '', t.pnl > 0 ? 'up' : t.pnl < 0 ? 'down' : ''],
+    ['Max drawdown', t.n ? dd.toFixed(2) : '—', 'peak to trough'],
+    ['Best day', bestDay ? fmtMoney(bestDay[1]) : '—', bestDay ? bestDay[0] : ''],
+  ].map(([k, v, s, cls]) => `<div class="tile"><div class="k">${k}</div><div class="v num ${cls || ''}">${v}</div><div class="s">${s}</div></div>`).join('');
+
+  if (!pnlChart && $('tab-history').classList.contains('on')) {
+    pnlChart = LightweightCharts.createChart($('pnlChart'), { ...chartOpts, timeScale: { ...chartOpts.timeScale, rightOffset: 2 } });
+    pnlSeries = pnlChart.addBaselineSeries({ baseValue: { type: 'price', price: 0 },
+      topLineColor: C('--up'), topFillColor1: 'rgba(31,191,117,.25)', topFillColor2: 'rgba(31,191,117,.02)',
+      bottomLineColor: C('--down'), bottomFillColor1: 'rgba(240,72,90,.02)', bottomFillColor2: 'rgba(240,72,90,.25)', lineWidth: 2 });
+  }
+  if (pnlSeries) { pnlSeries.setData(points); pnlChart.timeScale().fitContent(); }
+
+  const cls = v => v > 0 ? 'up' : v < 0 ? 'down' : '';
+  $('dayRows').innerHTML = days.size ? [...days.entries()].reverse().map(([day, v]) => {
+    const d = tally(v);
+    return `<tr><td class="num">${day}</td><td class="r num">${d.n}</td><td class="r num">${d.w} / ${d.l}</td>
+      <td class="r num ${d.rate > be() ? 'up' : 'down'}">${pct(d.rate)}</td><td class="r num ${cls(d.pnl)}">${fmtMoney(d.pnl)}</td></tr>`;
+  }).join('') : `<tr><td colspan="5" class="empty">No saved trades yet.</td></tr>`;
+
+  $('pairRows').innerHTML = pairs.size ? [...pairs.entries()].map(([k, v]) => [k.split('|'), tally(v)]).sort((a, b) => b[1].n - a[1].n).map(([[a, tf], d]) =>
+    `<tr><td>${esc(pairName(a))}</td><td>${tfLabel(Number(tf) || 60)}</td><td class="r num">${d.n}</td>
+     <td class="r num ${d.rate > be() ? 'up' : 'down'}">${pct(d.rate)}</td><td class="r num ${cls(d.pnl)}">${fmtMoney(d.pnl)}</td></tr>`).join('') :
+    `<tr><td colspan="5" class="empty">—</td></tr>`;
+
+  const recent = list.slice(-500).reverse();
+  $('histRows').innerHTML = recent.length ? recent.map(x => tradeRow(x, true)).join('') :
+    `<tr><td colspan="8" class="empty">Every live trade is saved and shows up here across sessions.</td></tr>`;
+}
+
+function groupBy(list, key) {
+  const m = new Map();
+  for (const x of list) { const k = key(x); if (!m.has(k)) m.set(k, []); m.get(k).push(x); }
+  return m;
+}
+
+// ---------- timers ----------
+setInterval(() => {
+  const cd = $('countdown'), period = S.tf * 1000;
+  const realtime = S.phase === 'live' && S.lastTs && Date.now() - S.recvAt < 5000;
+  if (!realtime) cd.style.display = 'none';
+  else {
+    cd.style.display = '';
+    const now = S.lastTs + (Date.now() - S.recvAt);
+    const into = now % period, left = Math.max(0, period - into) / 1000;
+    $('cdFill').style.width = (into / period * 100) + '%';
+    $('cdText').textContent = left.toFixed(0) + 's';
+  }
+}, 250);
+setInterval(() => { renderBridge(); renderAssets(); }, 5000);
+
+// ---------- tabs ----------
+document.querySelectorAll('.tabbar button').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('.tabbar button').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('.pane').forEach(p => p.classList.toggle('on', p.id === 'tab-' + b.dataset.tab));
+  if (b.dataset.tab === 'history') renderHistory();
+}));
+['fAsset', 'fTf', 'fFeed', 'fPeriod'].forEach(id => $(id).addEventListener('change', renderHistory));
+
+connect();
+</script>
+</body>
+</html>
