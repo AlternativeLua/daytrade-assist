@@ -48,8 +48,12 @@ OPTIONS:
     --tf <TIME>         Candle timeframe and expiry: 15s, 30s, 1m, 2m, 5m … [default: 1m]
     --history <FILE>    Learn from logged ticks first, then run the source
     --record <FILE>     Append every incoming tick to FILE (use it as --history next time)
-    --stake <N>         Paper stake per trade            [default: 10]
-    --payout <F>        Payout on a win, 0.85 = 85%      [default: 0.85]
+    --stake <N>         Base paper stake per trade       [default: 10]
+    --payout <F>        Payout on a win when the feed doesn't report one, 0.85 or 85 [default: 0.85]
+    --min-payout <F>    Don't trade pairs paying less than this [default: 0.85]
+    --martingale <N>    After a loss, multiply the stake, up to N losses in a row,
+                        then go back to the base stake; 0 = fixed stake [default: 4]
+    --martingale-mult <F>  Stake multiplier after each loss   [default: 2]
     --balance <N>       Starting paper balance           [default: 1000]
     --digits <N>        Price decimals to print          [default: 5]
     --no-heads-up       Don't preview signals before the candle closes
@@ -104,6 +108,11 @@ pub struct Config {
     pub asset: Option<String>,
     pub period_ms: i64,
     pub data_dir: Option<PathBuf>,
+    pub martingale_steps: u32,
+    pub martingale_mult: f64,
+    pub min_payout: f64,
+    /// Live feeds must report a payout before their pairs are traded.
+    pub require_payout: bool,
     demo: bool,
     window: bool,
     sim: SimParams,
@@ -157,6 +166,10 @@ fn parse_args() -> Result<Config, String> {
         asset: None,
         period_ms: 60_000,
         data_dir: bridged.then(default_data_dir),
+        martingale_steps: 4,
+        martingale_mult: 2.0,
+        min_payout: 0.85,
+        require_payout: bridged,
         demo: source_is_app,
         window: true,
         sim: SimParams {
@@ -192,7 +205,16 @@ fn parse_args() -> Result<Config, String> {
             "--journal" => cfg.journal = Some(value(&flag)?),
             "--data-dir" => cfg.data_dir = Some(PathBuf::from(value(&flag)?)),
             "--stake" => num!(cfg.stake),
-            "--payout" => num!(cfg.payout),
+            "--payout" => {
+                num!(cfg.payout);
+                cfg.payout = as_fraction(cfg.payout);
+            }
+            "--min-payout" => {
+                num!(cfg.min_payout);
+                cfg.min_payout = as_fraction(cfg.min_payout);
+            }
+            "--martingale" => num!(cfg.martingale_steps),
+            "--martingale-mult" => num!(cfg.martingale_mult),
             "--balance" => num!(cfg.balance),
             "--digits" => num!(cfg.digits),
             "--z" => num!(cfg.params.z),
@@ -218,6 +240,11 @@ fn parse_args() -> Result<Config, String> {
         }
     }
     Ok(cfg)
+}
+
+/// Accepts payouts as either 0.85 or 85.
+fn as_fraction(x: f64) -> f64 {
+    if x > 1.0 { x / 100.0 } else { x }
 }
 
 fn default_data_dir() -> PathBuf {

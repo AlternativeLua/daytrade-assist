@@ -3,7 +3,9 @@
 //
 // Pocket Option uses socket.io. Prices arrive as a binary attachment to an
 // `updateStream` event, shaped [["EURUSD_otc", <unix seconds>, <price>], ...],
-// and chart history as {asset, period, history: [[<unix seconds>, <price>], ...]}.
+// chart history as {asset, period, history: [[<unix seconds>, <price>], ...]},
+// and the asset table (`updateAssets`) as rows of
+// [id, symbol, name, kind, digits, payout%, ..., isOpen (index 14), ...].
 (() => {
   if (window.__daytradeAssistBridge) return;
   window.__daytradeAssistBridge = true;
@@ -20,11 +22,17 @@
     Array.isArray(x) && x.length >= 3 && typeof x[0] === 'string' &&
     typeof x[1] === 'number' && typeof x[2] === 'number';
 
+  const isAssetRow = (x) =>
+    Array.isArray(x) && x.length >= 15 && typeof x[1] === 'string' &&
+    typeof x[3] === 'string' && typeof x[5] === 'number';
+
   function handle(payload) {
     if (payload == null) return;
     if (Array.isArray(payload)) {
       if (payload.length && payload.every(isTick)) {
         emit('stream', payload.map(([asset, time, price]) => [asset, time, price]));
+      } else if (payload.length && payload.every(isAssetRow)) {
+        emit('assets', payload.map((r) => [r[1], r[5], r[14] ? 1 : 0, r[3], String(r[2] ?? r[1])]));
       } else if (typeof payload[0] === 'string' && payload.length >= 2) {
         handle(payload[1]); // socket.io event: ["name", data]
       }

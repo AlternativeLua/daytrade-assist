@@ -75,6 +75,14 @@
   .wr .be { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--warn); }
   .wr .lbl { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 4px; }
   .note { color: var(--faint); font-size: 12px; margin-top: 10px; }
+  .gate { display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 7px 10px; border-radius: 8px; background: var(--panel-2); font-size: 12px; }
+  .gate.ok { color: var(--up); } .gate.no { color: var(--warn); background: var(--warn-soft); }
+  .settings { display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center; margin-top: 12px; font-size: 12px; color: var(--muted); }
+  .settings select { width: 100%; font-size: 12px; padding: 4px 6px; }
+  .warnbox { margin-top: 8px; font-size: 11px; color: var(--warn); line-height: 1.4; }
+  .pay { font-weight: 700; }
+  .pay.hi { color: var(--up); } .pay.lo { color: var(--faint); }
+  tr.click { cursor: pointer; }
 
   section.tabs { grid-column: 1 / -1; padding: 0; }
   .tabbar { display: flex; gap: 2px; border-bottom: 1px solid var(--line); padding: 0 10px; overflow-x: auto; }
@@ -192,6 +200,25 @@
         <div class="track"><div class="fill" id="wrFill"></div><div class="be" id="wrBe"></div></div>
         <div class="lbl"><span>win rate <b class="num" id="wr">—</b></span><span>break-even <span class="num" id="be"></span></span></div>
       </div>
+      <div class="gate" id="gate"></div>
+      <div class="settings">
+        <span>After a loss</span>
+        <select id="setMart">
+          <option value="0">Keep the same stake</option>
+          <option value="1">Double, up to 1 time</option>
+          <option value="2">Double, up to 2 times</option>
+          <option value="3">Double, up to 3 times</option>
+          <option value="4">Double, up to 4 times</option>
+        </select>
+        <span>Selectivity</span>
+        <select id="setZ">
+          <option value="0">Loose (most signals)</option>
+          <option value="1">Normal</option>
+          <option value="1.5">Strict</option>
+          <option value="2">Very strict (fewest signals)</option>
+        </select>
+      </div>
+      <div class="warnbox" id="martWarn"></div>
       <div class="note num" id="backtest"></div>
       <div class="note num" id="lat"></div>
     </div>
@@ -201,12 +228,13 @@
     <div class="tabbar">
       <button data-tab="session" class="on">Session trades<span class="count" id="nSession"></span></button>
       <button data-tab="history">History<span class="count" id="nHistory"></span></button>
+      <button data-tab="payouts">Payouts<span class="count" id="nPayouts"></span></button>
       <button data-tab="rules">Rules</button>
     </div>
 
     <div class="pane on" id="tab-session">
       <div class="scroll"><table><thead><tr>
-        <th>Time</th><th>Pair</th><th>Side</th><th class="r">Entry</th><th class="r">Exit</th><th>Result</th><th class="r">P&amp;L</th><th>Rule</th>
+        <th>Time</th><th>Pair</th><th>Side</th><th class="r">Stake</th><th class="r">Entry</th><th class="r">Exit</th><th>Result</th><th class="r">P&amp;L</th><th>Rule</th>
       </tr></thead><tbody id="sessionRows"></tbody></table></div>
     </div>
 
@@ -231,9 +259,16 @@
       </div>
       <h3 style="margin-top:16px">Trades</h3>
       <div class="scroll"><table><thead><tr>
-        <th>Date / time</th><th>Pair</th><th>Side</th><th class="r">Entry</th><th class="r">Exit</th><th>Result</th><th class="r">P&amp;L</th><th>Rule</th>
+        <th>Date / time</th><th>Pair</th><th>Side</th><th class="r">Stake</th><th class="r">Entry</th><th class="r">Exit</th><th>Result</th><th class="r">P&amp;L</th><th>Rule</th>
       </tr></thead><tbody id="histRows"></tbody></table></div>
       <div class="note" id="journalPath"></div>
+    </div>
+
+    <div class="pane" id="tab-payouts">
+      <div class="scroll"><table><thead><tr>
+        <th>Pair</th><th class="r">Payout</th><th class="r">Break-even</th><th>Status</th><th>Prices here</th>
+      </tr></thead><tbody id="payoutRows"></tbody></table></div>
+      <div class="note" id="payoutNote"></div>
     </div>
 
     <div class="pane" id="tab-rules">
@@ -265,7 +300,7 @@
 <script>
 const $ = id => document.getElementById(id);
 const TIMEFRAMES = [15, 30, 60, 120, 300, 900];
-const S = { cfg: null, phase: 'connecting', asset: '', tf: 60, assets: [], bridge: { last: 0, ticks: 0 }, backtest: null,
+const S = { cfg: null, phase: 'connecting', asset: '', tf: 60, assets: [], bridge: { last: 0, ticks: 0 }, backtest: null, status: null, market: [],
   candles: [], forming: null, trades: [], journal: [], rules: [], stats: {}, signal: null, open: null, preview: null, lastTs: 0, recvAt: 0 };
 
 const css = getComputedStyle(document.documentElement);
@@ -296,7 +331,10 @@ const tfLabel = s => s % 3600 === 0 ? s / 3600 + 'h' : s % 60 === 0 ? s / 60 + '
 const assetInfo = () => S.assets.find(a => a.name === S.asset);
 function digitsFor(price) { return price >= 20 ? 3 : 5; }
 const digits = () => digitsFor((assetInfo() || {}).price || (S.candles.length ? S.candles[S.candles.length - 1][4] : 1));
-const be = () => S.cfg ? 1 / (1 + S.cfg.payout) : 0.5405;
+const payout = () => S.status && S.status.payout != null ? S.status.payout : S.cfg ? S.cfg.payout : 0.85;
+const minPayout = () => S.status ? S.status.minPayout : 0.85;
+const be = () => 1 / (1 + payout());
+const marketOf = a => S.market.find(m => m.asset === a);
 const fmtPx = (x, d) => x == null ? '—' : x.toFixed(d ?? digits());
 const fmtMoney = x => (x >= 0 ? '+' : '−') + Math.abs(x).toFixed(2);
 const pct = x => x == null || !isFinite(x) ? '—' : (x * 100).toFixed(1) + '%';
@@ -329,15 +367,21 @@ let assetKey = '';
 function renderAssets() {
   const now = Date.now();
   const list = S.assets.filter(a => a.ticks > 0);
-  const live = list.filter(a => !isDemo(a.name) && now - a.last < 120000);
-  const saved = list.filter(a => !isDemo(a.name) && now - a.last >= 120000);
+  const pay = a => (marketOf(a.name) || {}).payout;
+  const good = a => (marketOf(a.name) || {}).open && pay(a) >= minPayout() - 1e-9;
+  const byPay = (x, y) => (pay(y) ?? -1) - (pay(x) ?? -1);
+  const live = list.filter(a => !isDemo(a.name) && now - a.last < 120000).sort(byPay);
+  const saved = list.filter(a => !isDemo(a.name) && now - a.last >= 120000).sort(byPay);
   const demo = list.filter(a => isDemo(a.name));
-  const key = [live, saved, demo].map(g => g.map(a => a.name).join(',')).join('|') + '#' + S.asset;
+  const key = [live, saved, demo].map(g => g.map(a => a.name + pay(a)).join(',')).join('|') + '#' + S.asset + minPayout();
   if (key === assetKey) return;
   assetKey = key;
-  const opt = a => `<option value="${esc(a.name)}"${a.name === S.asset ? ' selected' : ''}>${esc(pairName(a.name))}</option>`;
+  const label = a => pairName(a.name) + (pay(a) != null ? ` · ${Math.round(pay(a) * 100)}%` : '');
+  const opt = a => `<option value="${esc(a.name)}"${a.name === S.asset ? ' selected' : ''}>${esc(label(a))}</option>`;
   const group = (label, g) => g.length ? `<optgroup label="${label}">${g.map(opt).join('')}</optgroup>` : '';
-  const html = group('Pocket Option · live', live) + group('Saved · no live prices', saved) + group('Demo · simulated', demo);
+  const min = Math.round(minPayout() * 100);
+  const html = group(`Pocket Option · ${min}%+ payout`, live.filter(good)) + group(`Pocket Option · under ${min}% (not traded)`, live.filter(a => !good(a))) +
+    group('Saved · no live prices', saved) + group('Demo · simulated', demo);
   $('assetSel').innerHTML = html || `<option value="">Waiting for prices…</option>`;
   if (S.asset && !list.some(a => a.name === S.asset)) $('assetSel').insertAdjacentHTML('afterbegin', `<option selected>${esc(pairName(S.asset))}</option>`);
 }
@@ -382,7 +426,7 @@ function connect() {
 function handle(m) {
   switch (m.type) {
     case 'snapshot':
-      Object.assign(S, { cfg: m.config, phase: m.phase, asset: m.asset, tf: m.tf, assets: m.assets, bridge: m.bridge, backtest: m.backtest,
+      Object.assign(S, { cfg: m.config, phase: m.phase, asset: m.asset, tf: m.tf, assets: m.assets, bridge: m.bridge, backtest: m.backtest, status: m.status, market: m.market,
         candles: m.candles, trades: m.trades, journal: m.journal, rules: m.rules, stats: m.stats, signal: m.signal, open: m.open, preview: m.preview });
       S.forming = m.forming ? m.forming.c : null;
       if (m.forming) { S.lastTs = m.forming.ts; S.recvAt = Date.now(); }
@@ -418,6 +462,12 @@ function handle(m) {
     case 'bridge':
       S.bridge = m.bridge; renderBridge();
       break;
+    case 'status':
+      S.status = m.status; renderAccount(); renderSignal();
+      break;
+    case 'market':
+      S.market = m.market; assetKey = ''; renderAssets(); renderPayouts(); renderAccount();
+      break;
   }
 }
 
@@ -436,7 +486,7 @@ function safeUpdate(b) { try { series.update(b); } catch { series.setData(allBar
 // ---------- render ----------
 function renderAll() {
   renderHeader(); renderAssets(); renderBridge(); renderOverlay();
-  renderPrice(); renderSignal(); renderAccount(); renderMarkers(); renderSession(); renderRules(); renderHistory();
+  renderPrice(); renderSignal(); renderAccount(); renderMarkers(); renderSession(); renderRules(); renderHistory(); renderPayouts();
 }
 
 function renderOverlay() {
@@ -467,7 +517,8 @@ function renderSignal() {
     dir.textContent = sig.side === 'CALL' ? 'CALL ▲' : 'PUT ▼';
     dir.className = 'dir ' + sig.side.toLowerCase();
     const start = sig.time + period;
-    sub.textContent = S.open ? `entry ${fmtPx(S.open.entry)} · ${clock(start)} → ${clock(start + period)}` : `candle ${clock(start)}`;
+    sub.textContent = S.open ? `entry ${fmtPx(S.open.entry)} · ${clock(start)} → ${clock(start + period)}`
+      : S.status && !S.status.canTrade ? `not traded: ${gateReason()}` : `candle ${clock(start)}`;
   } else {
     dir.textContent = 'HOLD'; dir.className = 'dir hold';
     sub.textContent = 'no rule is clearly beating break-even';
@@ -510,7 +561,50 @@ function renderAccount() {
     : '';
   $('lat').textContent = st.candles ? `decision latency p50 ≤${fmtNs(st.p50)} · p99 ≤${fmtNs(st.p99)} · max ${fmtNs(st.max)}` : '';
   $('nSession').textContent = S.trades.length || '';
+
+  const s2 = S.status, gate = $('gate');
+  if (s2) {
+    const stake = s2.steps ? ` · next stake ${s2.nextStake.toFixed(2)}${s2.step ? ` (after ${s2.step} loss${s2.step > 1 ? 'es' : ''})` : ''}` : ` · stake ${s2.nextStake.toFixed(2)}`;
+    gate.className = 'gate ' + (s2.canTrade ? 'ok' : 'no');
+    gate.textContent = s2.canTrade ? `Payout ${pct0(s2.payout)} · trading${stake}` : `Not trading: ${gateReason()}`;
+    if (document.activeElement !== $('setMart')) $('setMart').value = String(s2.steps);
+    if (document.activeElement !== $('setZ')) $('setZ').value = String(s2.z);
+    const p = s2.payout ?? S.cfg.payout, m = s2.mult;
+    let lose = 0, losing = null;
+    for (let k = 0; k <= s2.steps; k++) { if (losing == null && p * m ** k < lose + 1e-9) losing = k; lose += m ** k; }
+    $('martWarn').textContent = s2.steps ? `At ${pct0(p)} payout, a win only recovers earlier losses within ${losing == null ? s2.steps : losing - 1} loss${(losing ?? s2.steps + 1) - 1 === 1 ? '' : 'es'}. ` +
+      `${s2.steps + 1} losses in a row cost ${(lose * S.cfg.stake).toFixed(2)} (${lose}× the base stake). Doubling changes the size of wins and losses, not the win rate.` : '';
+  } else gate.textContent = '';
 }
+
+const pct0 = x => x == null ? '—' : Math.round(x * 100) + '%';
+function gateReason() {
+  const s2 = S.status;
+  if (!s2) return '';
+  if (s2.payout == null) return 'no payout reported for this pair yet';
+  if (!s2.open) return 'Pocket Option shows this pair as closed';
+  return `payout ${pct0(s2.payout)} is under ${pct0(s2.minPayout)}`;
+}
+
+function renderPayouts() {
+  const min = minPayout(), now = Date.now();
+  const streaming = new Set(S.assets.filter(a => a.ticks > 0 && now - a.last < 120000).map(a => a.name));
+  $('nPayouts').textContent = S.market.filter(m => m.open && m.payout >= min - 1e-9).length || '';
+  $('payoutRows').innerHTML = S.market.length ? S.market.map(m => {
+    const ok = m.open && m.payout >= min - 1e-9, live = streaming.has(m.asset);
+    return `<tr class="${live ? 'click' : ''}" data-asset="${esc(m.asset)}"><td>${esc(m.name || pairName(m.asset))}</td>
+      <td class="r num"><span class="pay ${ok ? 'hi' : 'lo'}">${pct0(m.payout)}</span></td><td class="r num">${pct(1 / (1 + m.payout))}</td>
+      <td>${!m.open ? '<span class="muted">closed</span>' : ok ? '<span class="up">tradeable</span>' : '<span class="muted">payout too low</span>'}</td>
+      <td>${live ? (m.asset === S.asset ? '<b>selected</b>' : '<span class="up">streaming · click to select</span>') : '<span class="muted">open it in Pocket Option</span>'}</td></tr>`;
+  }).join('') : `<tr><td colspan="5" class="empty">Payouts appear once Pocket Option is connected.</td></tr>`;
+  $('payoutNote').textContent = `Only pairs paying ${pct0(min)} or more are traded. Pocket Option changes payouts during the day; this list updates as it does. Pocket Option only streams prices for pairs you open, so open a pair there to get its prices here.`;
+}
+$('payoutRows').addEventListener('click', e => {
+  const tr = e.target.closest('tr.click');
+  if (tr && tr.dataset.asset !== S.asset) select(tr.dataset.asset, S.tf);
+});
+$('setMart').addEventListener('change', e => fetch('/api/settings', { method: 'POST', body: new URLSearchParams({ martingale: e.target.value }) }).catch(() => {}));
+$('setZ').addEventListener('change', e => fetch('/api/settings', { method: 'POST', body: new URLSearchParams({ z: e.target.value }) }).catch(() => {}));
 
 function renderMarkers() {
   const first = S.candles.length ? S.candles[0][0] : 0;
@@ -536,6 +630,7 @@ function tradeRow(x, full) {
   const dg = digitsFor(x.entry);
   return `<tr><td class="num">${when}</td><td>${esc(pairName(x.asset))} <span class="muted">${tfLabel(x.tf || 60)}</span></td>
     <td><span class="tag ${x.side}">${x.side}</span></td>
+    <td class="r num">${x.stake != null ? x.stake.toFixed(2) : '—'}${x.step ? `<span class="muted"> ×${2 ** x.step}</span>` : ''}</td>
     <td class="r num">${fmtPx(x.entry, dg)}</td><td class="r num">${fmtPx(x.exit, dg)}</td>
     <td><span class="tag ${x.outcome}">${x.outcome}</span></td>
     <td class="r num ${x.pnl > 0 ? 'up' : x.pnl < 0 ? 'down' : ''}">${fmtMoney(x.pnl)}</td>
@@ -545,7 +640,7 @@ function tradeRow(x, full) {
 function renderSession() {
   const rows = S.trades.slice(-500).reverse();
   $('sessionRows').innerHTML = rows.length ? rows.map(x => tradeRow(x, false)).join('') :
-    `<tr><td colspan="8" class="empty">No trades yet for this pair and timeframe.</td></tr>`;
+    `<tr><td colspan="9" class="empty">No trades yet for this pair and timeframe.</td></tr>`;
 }
 
 function renderRules() {
@@ -624,7 +719,7 @@ function renderHistory() {
 
   const recent = list.slice(-500).reverse();
   $('histRows').innerHTML = recent.length ? recent.map(x => tradeRow(x, true)).join('') :
-    `<tr><td colspan="8" class="empty">Every live trade is saved and shows up here across sessions.</td></tr>`;
+    `<tr><td colspan="9" class="empty">Every live trade is saved and shows up here across sessions.</td></tr>`;
 }
 
 function groupBy(list, key) {

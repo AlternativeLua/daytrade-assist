@@ -24,6 +24,9 @@ pub enum Input {
     /// `save` appends them to the asset's tick log.
     Backfill { asset: AssetId, ticks: Vec<Tick>, save: bool },
     Select { asset: AssetId, period_ms: i64 },
+    /// Current payout (0.92 = 92%) and whether each asset is open for trading.
+    Payouts(Vec<(AssetId, f64, bool)>),
+    Settings { martingale_steps: Option<u32>, z: Option<f64> },
     /// A finite source (file, stdin, instant sim) has finished.
     SourceDone,
 }

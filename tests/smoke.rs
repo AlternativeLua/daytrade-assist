@@ -141,6 +141,20 @@ fn bridge_ticks_reach_the_ui() {
     assert!(select.starts_with("HTTP/1.1 200"), "{select}");
     wait_for("the 15s timeframe", || snapshot(&addr).contains(r#""tf":15,"#));
 
+    // Payouts from the broker's asset table decide whether the pair is traded.
+    let assets = "assets\nEURUSD_otc,92,1,currency,EUR/USD OTC\nGBPUSD_otc,70,1,currency,GBP/USD OTC\nAAPL_otc,95,1,stock,Apple OTC\n";
+    assert!(request(&addr, "POST", "/ingest", ext, assets).starts_with("HTTP/1.1 200"));
+    wait_for("EURUSD_otc to be tradeable at 92%", || {
+        let s = snapshot(&addr);
+        s.contains(r#""payout":0.92,"open":true,"canTrade":true"#) && s.contains(r#""asset":"GBPUSD_otc""#) && !s.contains("AAPL_otc")
+    });
+    let lowered = "assets\nEURUSD_otc,80,1,currency,EUR/USD OTC\n";
+    assert!(request(&addr, "POST", "/ingest", ext, lowered).starts_with("HTTP/1.1 200"));
+    wait_for("trading to stop at 80%", || snapshot(&addr).contains(r#""payout":0.8,"open":true,"canTrade":false"#));
+    let settings = request(&addr, "POST", "/api/settings", ui.as_deref(), "martingale=0&z=1.5");
+    assert!(settings.starts_with("HTTP/1.1 200"), "{settings}");
+    wait_for("the new settings", || snapshot(&addr).contains(r#""steps":0,"mult":2,"z":1.5"#));
+
     wait_for("the tick log", || {
         std::fs::read_to_string(dir.join("ticks").join("EURUSD_otc.csv")).is_ok_and(|s| s.lines().count() > 10_000)
     });

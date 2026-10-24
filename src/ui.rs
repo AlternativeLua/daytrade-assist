@@ -90,12 +90,37 @@ pub enum Event {
         rule: Option<Pick>,
         balance: f64,
     },
+    Status(Status),
+}
+
+/// Trading conditions for the active pair: payout gate and stake sizing.
+#[derive(Clone, Copy, Debug)]
+pub struct Status {
+    pub payout: Option<f64>,
+    pub open: bool,
+    pub can_trade: bool,
+    pub min_payout: f64,
+    pub next_stake: f64,
+    pub step: u32,
+    pub steps: u32,
+    pub mult: f64,
+    pub z: f64,
+}
+
+/// One row of the broker's asset table.
+struct MarketRow {
+    asset: String,
+    name: String,
+    kind: String,
+    payout: f64,
+    open: bool,
 }
 
 enum Msg {
     Event(Box<Event>),
     Client(TcpStream),
     Bridge(usize),
+    Market(Vec<MarketRow>),
 }
 
 #[derive(Clone)]
@@ -222,7 +247,12 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
             Ok(())
         }
         ("POST", "/ingest") if from_extension => {
-            let n = ingest(&String::from_utf8_lossy(&req.body), shared);
+            let body = String::from_utf8_lossy(&req.body);
+            if body.starts_with("assets") {
+                let n = ingest_assets(&body, shared);
+                return respond(&mut stream, "200 OK", "text/plain", &n.to_string());
+            }
+            let n = ingest(&body, shared);
             let _ = shared.hub.send(Msg::Bridge(n));
             respond(&mut stream, "200 OK", "text/plain", &n.to_string())
         }
@@ -237,6 +267,13 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
                 }
                 _ => respond(&mut stream, "400 Bad Request", "text/plain", "unknown asset or timeframe"),
             }
+        }
+        ("POST", "/api/settings") if from_ui => {
+            let form = parse_form(&String::from_utf8_lossy(&req.body));
+            let martingale_steps = form.get("martingale").and_then(|v| v.parse::<u32>().ok()).filter(|n| *n <= 8);
+            let z = form.get("z").and_then(|v| v.parse::<f64>().ok()).filter(|z| (0.0..=4.0).contains(z));
+            let _ = shared.input.send(Input::Settings { martingale_steps, z });
+            respond(&mut stream, "200 OK", "text/plain", "ok")
         }
         ("POST", "/api/reveal-extension") if from_ui => {
             if let Some(dir) = &shared.extension_dir {
@@ -270,6 +307,40 @@ fn ingest(body: &str, shared: &Shared) -> usize {
     for (id, ticks) in backfills {
         let _ = shared.input.send(Input::Backfill { asset: id, ticks, save: true });
     }
+    n
+}
+
+/// Body: `assets`, then `asset,payout%,open,kind,name` lines from the broker's
+/// asset table. Payouts go to the engine; the table goes to the UI.
+fn ingest_assets(body: &str, shared: &Shared) -> usize {
+    let mut cache = AssetCache::new(shared.registry.clone());
+    let mut rows = Vec::new();
+    let mut payouts = Vec::new();
+    for line in body.lines().skip(1) {
+        let mut f = line.splitn(5, ',');
+        let (Some(asset), Some(payout), Some(open), Some(kind)) = (f.next(), f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        let Ok(payout) = payout.trim().parse::<f64>() else { continue };
+        let asset = asset.trim();
+        if asset.is_empty() || !(0.0..=1000.0).contains(&payout) {
+            continue;
+        }
+        let payout = payout / 100.0;
+        let open = open.trim() == "1";
+        payouts.push((cache.id(asset), payout, open));
+        rows.push(MarketRow {
+            asset: asset.to_owned(),
+            name: f.next().unwrap_or(asset).trim().to_owned(),
+            kind: kind.trim().to_owned(),
+            payout,
+            open,
+        });
+    }
+    let n = rows.len();
+    let _ = shared.input.send(Input::Payouts(payouts));
+    let _ = shared.hub.send(Msg::Market(rows));
+    let _ = shared.hub.send(Msg::Bridge(0));
     n
 }
 
@@ -329,6 +400,8 @@ struct Hub {
     journal: VecDeque<String>,
     journal_file: Option<File>,
     rules: String,
+    status: String,
+    market: String,
     balance: f64,
     signals: u32,
     lat: Histogram,
@@ -374,6 +447,8 @@ impl Hub {
             journal,
             journal_file,
             rules: "[]".into(),
+            status: "null".into(),
+            market: "[]".into(),
             signals: 0,
             lat: Histogram::default(),
             bridge_last: 0,
@@ -392,6 +467,10 @@ impl Hub {
             while let Some(msg) = next.take() {
                 match msg {
                     Msg::Client(stream) => self.add_client(stream),
+                    Msg::Market(rows) => {
+                        self.market = market_json(rows);
+                        out.push(format!(r#"{{"type":"market","market":{}}}"#, self.market));
+                    }
                     Msg::Bridge(n) => {
                         self.bridge_last = now_ms();
                         self.bridge_ticks += n as u64;
@@ -567,6 +646,21 @@ impl Hub {
                     self.stats_json(),
                 ))
             }
+            Event::Status(st) => {
+                self.status = format!(
+                    r#"{{"payout":{},"open":{},"canTrade":{},"minPayout":{},"nextStake":{},"step":{},"steps":{},"mult":{},"z":{}}}"#,
+                    st.payout.map_or("null".into(), num),
+                    st.open,
+                    st.can_trade,
+                    num(st.min_payout),
+                    num(st.next_stake),
+                    st.step,
+                    st.steps,
+                    num(st.mult),
+                    num(st.z),
+                );
+                Some(format!(r#"{{"type":"status","status":{}}}"#, self.status))
+            }
             Event::Preview { slot, sig } => {
                 self.preview = format!(r#"{{"slot":{slot},"signal":{}}}"#, self.signal_json(&sig, slot));
                 Some(format!(r#"{{"type":"preview","preview":{}}}"#, self.preview))
@@ -623,7 +717,7 @@ impl Hub {
             Outcome::Tie => "TIE",
         };
         format!(
-            r#"{{"session":{},"asset":"{}","tf":{},"source":"{}","time":{},"side":"{}","entry":{},"exit":{},"outcome":"{outcome}","pnl":{},"stake":{},"rule":{},"rate":{}}}"#,
+            r#"{{"session":{},"asset":"{}","tf":{},"source":"{}","time":{},"side":"{}","entry":{},"exit":{},"outcome":"{outcome}","pnl":{},"stake":{},"step":{},"payout":{},"rule":{},"rate":{}}}"#,
             self.session,
             escape(&self.asset),
             self.period_ms / 1000,
@@ -634,6 +728,8 @@ impl Hub {
             num(s.exit),
             num(s.pnl),
             num(s.trade.stake),
+            s.trade.step,
+            num(s.trade.payout),
             rule.map_or("null".into(), |p| format!("\"{}\"", rule_name(p.expert))),
             rule.map_or("null".into(), |p| num(p.rate)),
         )
@@ -661,7 +757,7 @@ impl Hub {
         let opt = |v: &Option<String>| v.as_deref().map_or("null".into(), |p| format!("\"{}\"", escape(p)));
         let _ = write!(
             s,
-            r#"{{"type":"snapshot","config":{{"stake":{},"payout":{},"balance":{},"z":{},"minSamples":{},"journal":{},"extensionDir":{},"session":{}}},"phase":"{}","asset":"{}","tf":{},"assets":{},"bridge":{},"backtest":{},"candles":["#,
+            r#"{{"type":"snapshot","config":{{"stake":{},"payout":{},"balance":{},"z":{},"minSamples":{},"journal":{},"extensionDir":{},"session":{}}},"phase":"{}","asset":"{}","tf":{},"assets":{},"bridge":{},"backtest":{},"status":{},"market":{},"candles":["#,
             num(c.stake),
             num(c.payout),
             num(c.balance),
@@ -676,6 +772,8 @@ impl Hub {
             self.assets,
             self.bridge_json(),
             self.backtest,
+            self.status,
+            self.market,
         );
         join(&mut s, self.candles.iter().map(|c| self.candle_json(c)));
         let forming = self
@@ -740,6 +838,28 @@ fn side_name(side: Side) -> &'static str {
 fn rule_name(expert: usize) -> String {
     let (verb, base) = expert_name(expert);
     format!("{verb} {base}")
+}
+
+/// Currency pairs only, best payout first.
+fn market_json(mut rows: Vec<MarketRow>) -> String {
+    rows.retain(|r| r.kind.eq_ignore_ascii_case("currency"));
+    rows.sort_by(|a, b| b.payout.total_cmp(&a.payout).then_with(|| a.asset.cmp(&b.asset)));
+    let mut s = String::from("[");
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(
+            s,
+            r#"{{"asset":"{}","name":"{}","payout":{},"open":{}}}"#,
+            escape(&r.asset),
+            escape(&r.name),
+            num(r.payout),
+            r.open
+        );
+    }
+    s.push(']');
+    s
 }
 
 fn rules_json(records: &[Record; EXPERTS]) -> String {

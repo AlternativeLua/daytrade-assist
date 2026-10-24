@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Stdout, Write};
 use std::sync::Arc;
@@ -9,9 +9,9 @@ use crate::Config;
 use crate::candle::{Aggregator, Candle, MIN_PERIOD_MS};
 use crate::feed::{AssetId, Input, Registry, Tick};
 use crate::latency::{Histogram, Ns};
-use crate::paper::{Outcome, Paper, Settlement};
-use crate::strategy::{EXPERTS, Engine, Pick, Side, Signal, expert_name};
-use crate::ui::{AssetInfo, Event, Phase, Ui};
+use crate::paper::{Martingale, Outcome, Paper, Settlement};
+use crate::strategy::{EXPERTS, Engine, Params, Pick, Side, Signal, expert_name};
+use crate::ui::{AssetInfo, Event, Phase, Status, Ui};
 
 /// About a week of ticks at Pocket Option's ~1 tick per second.
 pub const MAX_TICKS: usize = 600_000;
@@ -24,7 +24,27 @@ pub fn is_demo(name: &str) -> bool {
 struct Series {
     name: String,
     ticks: VecDeque<Tick>,
+    /// Opened on first use, so assets that never tick get no file.
     log: Option<BufWriter<File>>,
+    log_checked: bool,
+}
+
+impl Series {
+    fn append_log(&mut self, cfg: &Config, ticks: &[Tick]) -> io::Result<()> {
+        if !self.log_checked {
+            self.log_checked = true;
+            self.log = cfg.data_dir.as_ref().filter(|_| !is_demo(&self.name)).and_then(|dir| {
+                let path = dir.join("ticks").join(log_file_name(&self.name));
+                OpenOptions::new().create(true).append(true).open(path).ok().map(BufWriter::new)
+            });
+        }
+        if let Some(log) = &mut self.log {
+            for t in ticks {
+                writeln!(log, "{},{},{}", self.name, t.ts_ms, t.price)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The engine thread: buffers every asset's ticks, and runs the candle →
@@ -53,11 +73,20 @@ pub struct Session {
     quiet: bool,
     live: bool,
     replay_candles: Vec<Candle>,
+    /// Latest payout and open flag per asset, as reported by the feed.
+    payouts: HashMap<AssetId, (f64, bool)>,
+    can_trade: bool,
+    martingale: Martingale,
+    z: f64,
 }
 
 impl Session {
     pub fn new(cfg: &'static Config, registry: Arc<Registry>) -> io::Result<Self> {
-        let paper = Paper::new(cfg.balance, cfg.stake, cfg.payout);
+        let martingale = Martingale {
+            steps: cfg.martingale_steps,
+            mult: cfg.martingale_mult,
+        };
+        let paper = Paper::new(cfg.balance, cfg.stake, cfg.payout, martingale);
         let record = match &cfg.record {
             Some(path) => Some(BufWriter::new(
                 OpenOptions::new()
@@ -95,6 +124,10 @@ impl Session {
             quiet: cfg.quiet,
             live: true,
             replay_candles: Vec::new(),
+            payouts: HashMap::new(),
+            can_trade: true,
+            martingale,
+            z: cfg.params.z,
         })
     }
 
@@ -109,6 +142,23 @@ impl Session {
                 Input::Tick(id, t) => self.on_input_tick(id, t)?,
                 Input::Backfill { asset, ticks, save } => self.backfill(asset, ticks, save)?,
                 Input::Select { asset, period_ms } => self.select(asset, period_ms)?,
+                Input::Payouts(list) => {
+                    for (id, payout, open) in list {
+                        self.payouts.insert(id, (payout, open));
+                    }
+                    self.apply_payout();
+                }
+                Input::Settings { martingale_steps, z } => {
+                    if let Some(steps) = martingale_steps {
+                        self.martingale.steps = steps;
+                        self.paper.set_martingale(self.martingale);
+                    }
+                    if let Some(z) = z {
+                        self.z = z;
+                        self.engine.set_z(z);
+                    }
+                    self.push_status();
+                }
                 Input::SourceDone => {
                     done += 1;
                     if finite_sources > 0 && done >= finite_sources {
@@ -130,14 +180,11 @@ impl Session {
         }
         while self.series.len() <= id as usize {
             let name = self.registry.name(self.series.len() as AssetId);
-            let log = self.cfg.data_dir.as_ref().filter(|_| !is_demo(&name)).and_then(|dir| {
-                let path = dir.join("ticks").join(log_file_name(&name));
-                OpenOptions::new().create(true).append(true).open(path).ok().map(BufWriter::new)
-            });
             self.series.push(Series {
                 name,
                 ticks: VecDeque::new(),
-                log,
+                log: None,
+                log_checked: false,
             });
         }
         self.push_assets();
@@ -160,9 +207,7 @@ impl Session {
             s.ticks.pop_front();
         }
         s.ticks.push_back(t);
-        if let Some(log) = &mut s.log {
-            writeln!(log, "{},{},{}", s.name, t.ts_ms, t.price)?;
-        }
+        s.append_log(self.cfg, &[t])?;
         if let Some(r) = &mut self.record {
             writeln!(r, "{},{},{}", s.name, t.ts_ms, t.price)?;
         }
@@ -204,10 +249,8 @@ impl Session {
         if ticks.is_empty() {
             return Ok(());
         }
-        if let Some(log) = s.log.as_mut().filter(|_| save) {
-            for t in &ticks {
-                writeln!(log, "{},{},{}", s.name, t.ts_ms, t.price)?;
-            }
+        if save {
+            s.append_log(self.cfg, &ticks)?;
         }
         for &t in ticks.iter().rev() {
             s.ticks.push_front(t);
@@ -230,7 +273,8 @@ impl Session {
         self.active = Some(id);
         self.agg = Aggregator::new(period_ms);
         self.p.period_ms = period_ms;
-        self.engine = Engine::new(self.cfg.params, self.paper.breakeven());
+        let params = Params { z: self.z, ..self.cfg.params };
+        self.engine = Engine::new(params, 1.0 / (1.0 + self.payout_or_default()));
         self.reset_account();
         self.previewed_slot = i64::MIN;
         self.learning = true;
@@ -281,7 +325,52 @@ impl Session {
         self.reset_account();
         self.phase(Phase::Live);
         self.push_assets();
+        self.apply_payout();
         Ok(())
+    }
+
+    /// The active asset's payout and open flag, if they are known. Assets from
+    /// sources without payout data (demo pairs, files, the CLI) use `--payout`.
+    fn active_payout(&self) -> Option<(f64, bool)> {
+        let id = self.active?;
+        if let Some(&p) = self.payouts.get(&id) {
+            return Some(p);
+        }
+        let demo = is_demo(&self.series[id as usize].name);
+        (!self.cfg.require_payout || demo).then_some((self.cfg.payout, true))
+    }
+
+    fn payout_or_default(&self) -> f64 {
+        self.active_payout().map_or(self.cfg.payout, |(p, _)| p)
+    }
+
+    /// Re-prices the engine and account for the active asset's payout, and
+    /// stops trading while it is closed or pays less than `--min-payout`.
+    fn apply_payout(&mut self) {
+        let payout = self.payout_or_default();
+        self.paper.payout = payout;
+        self.engine.set_breakeven(1.0 / (1.0 + payout));
+        self.can_trade = self
+            .active_payout()
+            .is_some_and(|(p, open)| open && p + 1e-9 >= self.cfg.min_payout);
+        self.push_status();
+    }
+
+    fn push_status(&self) {
+        if let Some(ui) = &self.ui {
+            let known = self.active_payout();
+            ui.send(Event::Status(Status {
+                payout: known.map(|(p, _)| p),
+                open: known.is_some_and(|(_, open)| open),
+                can_trade: self.can_trade,
+                min_payout: self.cfg.min_payout,
+                next_stake: self.paper.next_stake(),
+                step: self.paper.step,
+                steps: self.martingale.steps,
+                mult: self.martingale.mult,
+                z: self.z,
+            }));
+        }
     }
 
     fn phase(&self, phase: Phase) {
@@ -321,7 +410,7 @@ impl Session {
 
     /// Keeps what the engine has learned, starts a fresh account and stats.
     fn reset_account(&mut self) {
-        self.paper = Paper::new(self.cfg.balance, self.cfg.stake, self.cfg.payout);
+        self.paper = Paper::new(self.cfg.balance, self.cfg.stake, self.payout_or_default(), self.martingale);
         self.close_lat = Histogram::default();
         self.tick_lat = Histogram::default();
         self.signals = 0;
@@ -338,7 +427,9 @@ impl Session {
             let settled = self.paper.settle(&closed);
             let sig = self.engine.on_close(&closed);
             let new_slot = self.agg.slot(tick.ts_ms);
-            let opened = sig.side.is_some_and(|side| self.paper.open(side, tick.price, new_slot));
+            // Payout gating only applies live; history replays show what the rules would do.
+            let allowed = self.can_trade || !self.live;
+            let opened = allowed && sig.side.is_some_and(|side| self.paper.open(side, tick.price, new_slot));
             let dt = t0.elapsed();
             self.close_lat.record(dt);
             self.tick_lat.record(dt);
@@ -359,6 +450,9 @@ impl Session {
                         balance: self.paper.balance,
                     });
                 }
+                if settled.is_some() || opened {
+                    self.push_status();
+                }
                 if opened {
                     self.open_pick = sig.best;
                 }
@@ -374,7 +468,8 @@ impl Session {
                 if let Some(s) = settled {
                     self.p.settlement(&mut self.out, &s, &self.paper)?;
                 }
-                self.p.candle(&mut self.out, &closed, &sig, opened.then_some(tick.price), dt.as_nanos() as u64)?;
+                let skipped = if allowed { "insufficient balance" } else { "payout below minimum or pair closed" };
+                self.p.candle(&mut self.out, &closed, &sig, opened.then_some(tick.price), skipped, dt.as_nanos() as u64)?;
                 self.out.flush()?;
             }
             return Ok(());
@@ -486,7 +581,7 @@ impl Printer {
         })
     }
 
-    fn candle(&self, out: &mut impl Write, c: &Candle, sig: &Signal, entry: Option<f64>, ns: u64) -> io::Result<()> {
+    fn candle(&self, out: &mut impl Write, c: &Candle, sig: &Signal, entry: Option<f64>, skipped: &str, ns: u64) -> io::Result<()> {
         let d = self.cfg.digits;
         write!(out, "{}  O {:.d$} H {:.d$} L {:.d$} C {:.d$}  ", self.time(c.slot), c.open, c.high, c.low, c.close)?;
         if let Some(n) = sig.learning {
@@ -507,7 +602,7 @@ impl Printer {
                 self.rule(sig),
                 self.time(c.slot + 2),
             )?,
-            (Some(side), None) => write!(out, "{} (skipped: insufficient balance)", self.side_label(side))?,
+            (Some(side), None) => write!(out, "{} (skipped: {skipped})", self.side_label(side))?,
             (None, _) => write!(out, "{}", self.paint("2", &format!("hold   best: {}", self.rule(sig))))?,
         }
         writeln!(out, "  {}", Ns(ns))
@@ -537,9 +632,10 @@ impl Printer {
         let side = if s.trade.side == Side::Call { "CALL" } else { "PUT " };
         writeln!(
             out,
-            "       └ {side} {:.d$} → {:.d$}  {result}   balance {:.2}   {}W/{}L/{}T {:.1}%",
+            "       └ {side} {:.d$} → {:.d$}  stake {:.2}  {result}   balance {:.2}   {}W/{}L/{}T {:.1}%",
             s.trade.entry,
             s.exit,
+            s.trade.stake,
             paper.balance,
             paper.wins,
             paper.losses,
@@ -583,6 +679,21 @@ impl Printer {
             "balance   {:.2}   P&L {pnl:+.2}   max drawdown {:.2}",
             paper.balance, paper.max_drawdown
         )?;
+        if paper.staked > 0.0 {
+            let sizing = if paper.martingale.steps > 0 {
+                format!("×{} after a loss, up to {} times", paper.martingale.mult, paper.martingale.steps)
+            } else {
+                "fixed".to_owned()
+            };
+            writeln!(
+                out,
+                "stakes    base {:.2}, {sizing}   largest {:.2}   total staked {:.2}   return {:+.1}% of staked",
+                paper.base_stake,
+                paper.max_stake,
+                paper.staked,
+                pnl / paper.staked * 100.0,
+            )?;
+        }
         if close.count() > 0 {
             writeln!(
                 out,

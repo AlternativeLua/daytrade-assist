@@ -248,6 +248,15 @@ impl Engine {
         }
     }
 
+    /// Break-even win rate a rule must beat, for when the payout changes.
+    pub fn set_breakeven(&mut self, breakeven: f64) {
+        self.threshold = breakeven + self.p.margin;
+    }
+
+    pub fn set_z(&mut self, z: f64) {
+        self.p.z = z;
+    }
+
     pub fn records(&self) -> &[Record; EXPERTS] {
         &self.records
     }

@@ -33,6 +33,34 @@ Each pair you open in Pocket Option is added to the list. The extension's badge 
 
 The extension reads socket.io `updateStream` frames (`[["EURUSD_otc", <unix seconds>, <price>], …]`) and `history` arrays. These formats come from open-source Pocket Option clients and may change without notice. Pocket Option doesn't support third-party tools, so check its terms before using one.
 
+## Payouts and stake sizing
+
+**Payout filter.** The bridge also reads Pocket Option's asset table, so the app knows each pair's live payout and whether it's open. Only pairs paying **85% or more** are traded (`--min-payout`). Below that, signals still show but no trade is placed. The **Payouts** tab lists every OTC currency pair by current payout. Pocket Option only streams prices for pairs you open, so open a high-payout pair there to trade it. Each trade is priced at the payout it opened with.
+
+**Doubling after a loss** (`--martingale`, default 4). After a loss the next stake doubles, up to 4 losses in a row (10 → 20 → 40 → 80 → 160). A win, or a fifth loss in a row, goes back to the base stake. You can change it in the app under *After a loss*, or turn it off.
+
+What it does and doesn't do (6 simulated runs × 20,000 candles each, $10 base stake):
+
+| feed | payout | doubling | win rate | return per $ staked | worst drawdown | runs that lost 90%+ of $1,000 |
+|---|---|---|---|---|---|---|
+| no edge | 92% | off | 49.6% | −4.9% | 796 | 0/6 |
+| no edge | 92% | ×2, 4 times | 49.6% | −4.3% | 2,402 | 3/6 |
+| weak edge | 85% | off | 55.4% | +2.5% | 624 | 0/6 |
+| weak edge | 85% | ×2, 4 times | 55.4% | +3.3% | 3,318 | 0/6 |
+| real edge | 92% | off | 56.5% | +8.5% | 364 | 0/6 |
+| real edge | 92% | ×2, 4 times | 56.5% | +7.8% | 3,098 | 0/6 |
+
+Doubling never changes the win rate, and it barely changes the return per dollar staked. What it does is stake more after losses, which multiplies the drawdowns about 5 times. At an 85% payout, a win only recovers the earlier losses if it comes within 2 losses. Five losses in a row cost 31× the base stake.
+
+**Selectivity** (`--z`, *Selectivity* in the app) trades off how often it signals against how sure it is:
+
+| weak-edge feed | candles traded | win rate |
+|---|---|---|
+| Loose | 86% | 55.0% |
+| Normal (default) | 51% | 55.4% |
+| Strict | 29% | 56.0% |
+| Very strict | 12% | 56.5% |
+
 ## How it decides
 
 OTC prices come from each broker's own price generator, and the generators aren't public, so no fixed indicator recipe can be trusted to carry over. The bot learns from the feed it is given instead:
@@ -40,11 +68,11 @@ OTC prices come from each broker's own price generator, and the generators aren'
 1. Each closed candle feeds 12 base signals: last candle colour, 3-candle streak, the move in the last sixth of the candle, RSI(2), RSI(14), Bollinger ±2σ and ±1σ, stochastic(5,3), EMA 9/21 trend, wick rejection, trend pullback, and where the close sits in the candle's range.
 2. Each base signal is a pair of rules: **follow** (trade in its direction) and **fade** (trade against it), 24 rules in total. The feed decides which direction works.
 3. Every vote from every rule is scored against the next candle, whether it was traded or not. Recent votes count more (`--half-life`, 400 votes by default).
-4. A rule is only traded while the lower confidence bound of its win rate (Wilson, `--z`) is above the payout's break-even rate. With 85% payout that rate is 54.1%.
+4. A rule is only traded while the lower confidence bound of its win rate (Wilson, `--z`) is above the pair's break-even rate at its current payout (54.1% at 85%, 52.1% at 92%).
 
 Each pair and timeframe is learned separately. The decision takes about 250 ns. Logging, the UI and the bridge all run on other threads, after the decision is made.
 
-### Calibration (simulated, 6 seeds × 20,000 candles, z = 1)
+### Calibration (simulated, 6 seeds × 20,000 candles, z = 1, fixed stake)
 
 | feed | candles traded | win rate | per $1 staked |
 |---|---|---|---|

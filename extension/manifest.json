@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Daytrade Assist — Pocket Option bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Read-only: forwards the Pocket Option price stream your browser already receives to Daytrade Assist on this computer. Never places trades.",
   "host_permissions": ["http://127.0.0.1:8787/*"],
   "background": { "service_worker": "background.js" },
