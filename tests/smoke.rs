@@ -153,9 +153,95 @@ fn bridge_ticks_reach_the_ui() {
     wait_for("trading to stop at 80%", || snapshot(&addr).contains(r#""payout":0.8,"open":true,"canTrade":false"#));
     let settings = request(&addr, "POST", "/api/settings", ui.as_deref(), "martingale=0&z=1.5");
     assert!(settings.starts_with("HTTP/1.1 200"), "{settings}");
-    wait_for("the new settings", || snapshot(&addr).contains(r#""steps":0,"mult":2,"z":1.5"#));
+    wait_for("the new settings", || snapshot(&addr).contains(r#""steps":0,"mult":2.1,"z":1.5"#));
 
     wait_for("the tick log", || {
         std::fs::read_to_string(dir.join("ticks").join("EURUSD_otc.csv")).is_ok_and(|s| s.lines().count() > 10_000)
+    });
+}
+
+#[test]
+fn autotrade_hands_orders_to_the_bridge() {
+    let addr = free_addr();
+    let dir = std::env::temp_dir().join(format!("daytrade-orders-{}", std::process::id()));
+    let child = Command::new(BIN)
+        .args(["pocket", "--quiet", "--no-color", "--ui-addr", &addr, "--data-dir"])
+        .arg(&dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _running = Running(child, dir.clone());
+    wait_for("the UI server", || TcpStream::connect(&addr).is_ok());
+    let ext = Some("chrome-extension://smoke-test");
+    let ui = format!("http://{addr}");
+    let post = |path: &str, origin: Option<&str>, body: &str| {
+        let r = request(&addr, "POST", path, origin, body);
+        assert!(r.starts_with("HTTP/1.1 200"), "{path}: {r}");
+    };
+
+    // One-second candles that alternate colour every candle: "fade last-candle" is always right.
+    let start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 - 600;
+    let candle = |k: i64| {
+        let close = if k % 2 == 0 { 1.0852 } else { 1.0848 };
+        format!("EURUSD_otc,{k}.0,1.08500\nEURUSD_otc,{k}.5,{close:.5}\n")
+    };
+    post("/ingest", ext, "assets\nEURUSD_otc,92,1,currency,EUR/USD OTC\n");
+    post("/ingest", ext, &format!("history\n{}", (start..start + 590).map(candle).collect::<String>()));
+    post("/ingest", ext, &format!("stream\n{}", candle(start + 590)));
+    wait_for("EURUSD_otc to go live", || snapshot(&addr).contains(r#""asset":"EURUSD_otc""#));
+    post("/api/select", Some(&ui), "asset=EURUSD_otc&tf=1");
+    post("/api/settings", Some(&ui), "mode=demo&stake=5&mult=2.1");
+    wait_for("1s candles with demo trading on", || {
+        let s = snapshot(&addr);
+        s.contains(r#""tf":1,"#) && s.contains(r#""phase":"live""#) && s.contains(r#""mode":"demo""#) && s.contains(r#""stake":5,"#) && s.contains(r#""mult":2.1"#)
+    });
+
+    // The next candle close produces a signal, a paper trade and an order for the bridge.
+    post("/ingest", ext, &format!("stream\n{}{}", candle(start + 591), candle(start + 592)));
+    let orders = request(&addr, "GET", "/bridge/orders", ext, "");
+    assert!(orders.starts_with("HTTP/1.1 200"), "{orders}");
+    let line = orders.lines().last().unwrap().to_owned();
+    let f: Vec<&str> = line.split(',').collect();
+    assert_eq!((f[0], f[2], f[4], f[5], f[6]), ("order", "EURUSD_otc", "5", "1", "demo"), "{line}");
+    assert!(f[3] == "call" || f[3] == "put", "{line}");
+
+    // What the bridge reports back from Pocket Option.
+    let req = f[1];
+    post("/ingest", ext, &format!("orders\nopened,{req},deal-1,1.085\nclosed,{req},deal-1,4.6,1.0852\n"));
+    wait_for("the settled order", || {
+        let s = snapshot(&addr);
+        s.contains(&format!(r#""requestId":"{req}""#)) && s.contains(r#""status":"won""#) && s.contains(r#""profit":4.6"#)
+    });
+
+    // A website can't pull orders.
+    assert!(request(&addr, "GET", "/bridge/orders", Some("https://example.com"), "").starts_with("HTTP/1.1 404"));
+
+    // Real money only with the confirmation text the UI sends after its two prompts.
+    let refused = request(&addr, "POST", "/api/settings", Some(&ui), "mode=real");
+    assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+    post(
+        "/api/settings",
+        Some(&ui),
+        "mode=real&lossLimit=25&confirm=I+accept+the+risk+of+losing+real+money",
+    );
+    wait_for("real mode", || {
+        let s = snapshot(&addr);
+        s.contains(r#""mode":"real""#) && s.contains(r#""lossLimit":25"#)
+    });
+
+    // Paused: candles keep closing and being logged, but nothing is traded.
+    post("/api/settings", Some(&ui), "paused=1&mode=off");
+    wait_for("pause", || snapshot(&addr).contains(r#""mode":"off","paused":true"#));
+    post("/ingest", ext, &format!("stream\n{}{}{}", candle(start + 593), candle(start + 594), candle(start + 595)));
+    let log_dir = dir.join("logs");
+    wait_for("the decision log", || {
+        std::fs::read_dir(&log_dir).ok().and_then(|mut d| d.next()).and_then(|e| e.ok()).is_some_and(|e| {
+            let log = std::fs::read_to_string(e.path()).unwrap_or_default();
+            log.contains(r#""type":"candle""#)
+                && log.contains(r#""type":"order""#)
+                && log.contains(r#""bases":["#)
+                && log.lines().any(|l| l.contains(r#""traded":false"#) && l.contains(r#""paused":true"#))
+        })
     });
 }

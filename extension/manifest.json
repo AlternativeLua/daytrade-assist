@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Daytrade Assist — Pocket Option bridge",
-  "version": "0.2.0",
-  "description": "Read-only: forwards the Pocket Option price stream your browser already receives to Daytrade Assist on this computer. Never places trades.",
+  "version": "0.3.0",
+  "description": "Forwards Pocket Option prices and payouts to Daytrade Assist on this computer, and places its signals as trades on your Pocket Option account when you turn that on in the app.",
   "host_permissions": ["http://127.0.0.1:8787/*"],
   "background": { "service_worker": "background.js" },
   "action": { "default_title": "Daytrade Assist bridge" },

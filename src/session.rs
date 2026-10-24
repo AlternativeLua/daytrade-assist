@@ -7,11 +7,12 @@ use std::time::Instant;
 
 use crate::Config;
 use crate::candle::{Aggregator, Candle, MIN_PERIOD_MS};
-use crate::feed::{AssetId, Input, Registry, Tick};
+use crate::feed::{AssetId, Input, Registry, Tick, TradeMode};
 use crate::latency::{Histogram, Ns};
 use crate::paper::{Martingale, Outcome, Paper, Settlement};
 use crate::strategy::{EXPERTS, Engine, Params, Pick, Side, Signal, expert_name};
-use crate::ui::{AssetInfo, Event, Phase, Status, Ui};
+use crate::feed::now_ms;
+use crate::ui::{AssetInfo, Event, OrderSent, Phase, Status, Ui};
 
 /// About a week of ticks at Pocket Option's ~1 tick per second.
 pub const MAX_TICKS: usize = 600_000;
@@ -78,6 +79,17 @@ pub struct Session {
     can_trade: bool,
     martingale: Martingale,
     z: f64,
+    stake: f64,
+    /// Whether live paper trades are also placed on Pocket Option, and on which account.
+    mode: TradeMode,
+    /// No new trades of any kind while paused; learning and signals continue.
+    paused: bool,
+    loss_limit: f64,
+    /// Profit and loss of trades mirrored to the real account since it was turned on.
+    real_pnl: f64,
+    open_mirror: TradeMode,
+    stop_reason: Option<String>,
+    order_seq: u64,
 }
 
 impl Session {
@@ -128,6 +140,14 @@ impl Session {
             can_trade: true,
             martingale,
             z: cfg.params.z,
+            stake: cfg.stake,
+            mode: TradeMode::Off,
+            paused: false,
+            loss_limit: cfg.loss_limit,
+            real_pnl: 0.0,
+            open_mirror: TradeMode::Off,
+            stop_reason: None,
+            order_seq: 0,
         })
     }
 
@@ -148,14 +168,34 @@ impl Session {
                     }
                     self.apply_payout();
                 }
-                Input::Settings { martingale_steps, z } => {
-                    if let Some(steps) = martingale_steps {
+                Input::Settings(change) => {
+                    if let Some(steps) = change.martingale_steps {
                         self.martingale.steps = steps;
-                        self.paper.set_martingale(self.martingale);
                     }
-                    if let Some(z) = z {
+                    if let Some(mult) = change.martingale_mult {
+                        self.martingale.mult = mult;
+                    }
+                    self.paper.set_martingale(self.martingale);
+                    if let Some(z) = change.z {
                         self.z = z;
                         self.engine.set_z(z);
+                    }
+                    if let Some(stake) = change.stake {
+                        self.stake = stake;
+                        self.paper.base_stake = stake;
+                    }
+                    if let Some(limit) = change.loss_limit {
+                        self.loss_limit = limit;
+                    }
+                    if let Some(mode) = change.mode {
+                        if mode == TradeMode::Real && self.mode != TradeMode::Real {
+                            self.real_pnl = 0.0;
+                        }
+                        self.mode = mode;
+                        self.stop_reason = None;
+                    }
+                    if let Some(paused) = change.paused {
+                        self.paused = paused;
                     }
                     self.push_status();
                 }
@@ -360,6 +400,12 @@ impl Session {
         if let Some(ui) = &self.ui {
             let known = self.active_payout();
             ui.send(Event::Status(Status {
+                mode: self.mode,
+                paused: self.paused,
+                loss_limit: self.loss_limit,
+                real_pnl: self.real_pnl,
+                stop_reason: self.stop_reason.clone(),
+                stake: self.stake,
                 payout: known.map(|(p, _)| p),
                 open: known.is_some_and(|(_, open)| open),
                 can_trade: self.can_trade,
@@ -410,7 +456,7 @@ impl Session {
 
     /// Keeps what the engine has learned, starts a fresh account and stats.
     fn reset_account(&mut self) {
-        self.paper = Paper::new(self.cfg.balance, self.cfg.stake, self.payout_or_default(), self.martingale);
+        self.paper = Paper::new(self.cfg.balance, self.stake, self.payout_or_default(), self.martingale);
         self.close_lat = Histogram::default();
         self.tick_lat = Histogram::default();
         self.signals = 0;
@@ -427,8 +473,20 @@ impl Session {
             let settled = self.paper.settle(&closed);
             let sig = self.engine.on_close(&closed);
             let new_slot = self.agg.slot(tick.ts_ms);
-            // Payout gating only applies live; history replays show what the rules would do.
-            let allowed = self.can_trade || !self.live;
+            // Payout gating and pausing only apply live; history replays show what the rules would do.
+            let allowed = !self.live || (self.can_trade && !self.paused);
+            if let Some(s) = &settled {
+                if std::mem::replace(&mut self.open_mirror, TradeMode::Off) == TradeMode::Real {
+                    self.real_pnl += s.pnl;
+                    if self.mode == TradeMode::Real && self.real_pnl <= -self.loss_limit {
+                        self.mode = TradeMode::Off;
+                        self.stop_reason = Some(format!(
+                            "real trading stopped: lost {:.2}, the loss limit is {:.2}",
+                            -self.real_pnl, self.loss_limit
+                        ));
+                    }
+                }
+            }
             let opened = allowed && sig.side.is_some_and(|side| self.paper.open(side, tick.price, new_slot));
             let dt = t0.elapsed();
             self.close_lat.record(dt);
@@ -455,6 +513,22 @@ impl Session {
                 }
                 if opened {
                     self.open_pick = sig.best;
+                    if let (Some(trade), Some(id)) = (self.paper.open, self.active) {
+                        let asset = &self.series[id as usize].name;
+                        if self.mode != TradeMode::Off && !is_demo(asset) {
+                            self.order_seq += 1;
+                            self.open_mirror = self.mode;
+                            ui.place_order(OrderSent {
+                                account: self.mode,
+                                request_id: (now_ms() * 100 + (self.order_seq % 100) as i64).to_string(),
+                                asset: asset.clone(),
+                                call: trade.side == Side::Call,
+                                amount: (trade.stake * 100.0).round() / 100.0,
+                                expiry_secs: self.agg.period_ms() / 1000,
+                                time_ms: tick.ts_ms,
+                            });
+                        }
+                    }
                 }
                 ui.send(Event::Closed {
                     candle: closed,
@@ -468,7 +542,13 @@ impl Session {
                 if let Some(s) = settled {
                     self.p.settlement(&mut self.out, &s, &self.paper)?;
                 }
-                let skipped = if allowed { "insufficient balance" } else { "payout below minimum or pair closed" };
+                let skipped = if !allowed && self.paused {
+                    "paused"
+                } else if allowed {
+                    "insufficient balance"
+                } else {
+                    "payout below minimum or pair closed"
+                };
                 self.p.candle(&mut self.out, &closed, &sig, opened.then_some(tick.price), skipped, dt.as_nanos() as u64)?;
                 self.out.flush()?;
             }

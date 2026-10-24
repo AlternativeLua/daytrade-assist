@@ -121,6 +121,8 @@ pub struct Signal {
     pub learning: Option<f64>,
     pub rsi: f64,
     pub z: f64,
+    /// Base signals in `BASES` order (+1 up, -1 down, 0 none), for the decision log.
+    pub bases: [i8; BASES.len()],
 }
 
 #[derive(Clone, Copy)]
@@ -289,6 +291,7 @@ impl Engine {
             learning: (most < self.p.min_samples).then_some(most),
             rsi,
             z,
+            bases,
         };
         let mut best_call: Option<Pick> = None;
         let mut best_put: Option<Pick> = None;

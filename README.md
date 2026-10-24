@@ -23,7 +23,7 @@ The app keeps its data in `~/Library/Application Support/Daytrade Assist` on mac
 
 ## Connect Pocket Option
 
-Pocket Option has no public API. Instead, a small Chrome extension reads the price stream that your logged-in Pocket Option tab already receives, and forwards it to the app on `127.0.0.1:8787`. It never sees your password, never sends anything to Pocket Option, and never places trades.
+Pocket Option has no public API. Instead, a small Chrome extension reads the price stream that your logged-in Pocket Option tab already receives, and forwards it to the app on `127.0.0.1:8787`. It never sees your password. It only sends anything to Pocket Option if you turn on demo-account trading (see below).
 
 1. In Chrome, open `chrome://extensions` and turn on **Developer mode**.
 2. Click **Load unpacked** and choose the `pocket-option-bridge` folder. The app's **Connect Pocket Option** button has a **Show folder** shortcut.
@@ -33,13 +33,41 @@ Each pair you open in Pocket Option is added to the list. The extension's badge 
 
 The extension reads socket.io `updateStream` frames (`[["EURUSD_otc", <unix seconds>, <price>], …]`) and `history` arrays. These formats come from open-source Pocket Option clients and may change without notice. Pocket Option doesn't support third-party tools, so check its terms before using one.
 
+## Placing trades on Pocket Option
+
+By default the app only shows signals and keeps its own paper account. The **Pocket Option** setting in the account card changes that:
+
+- **Place trades on demo account:** every live paper trade on a Pocket Option pair becomes an order on your demo account, with the same direction and amount (including the multiplier after a loss). Its expiry is one candle of the selected timeframe.
+- **Place trades with REAL money:** the same, but on your real-money account. Turning it on takes two confirmations:
+  1. Read the risks, set a loss limit and tick that you understand.
+  2. Type `REAL`.
+
+  The server also refuses the switch unless it carries the confirmation, so a stray click or another web page can't turn it on.
+
+  Real-money trading turns itself off when you restart the app, when you press Pause, or when trades placed with real money have lost the loss limit (`--loss-limit`, default 100). That limit is measured on the matching paper trades. While it's on, a red banner stays at the top of the window.
+
+How orders are placed:
+- The extension sends Pocket Option's own `openOrder` message, the same one the site's Buy buttons send, through your open Pocket Option tab.
+- It only sends an order on a connection whose login matches the order's account: demo orders on a demo login, real orders on a real-money login. A mismatch is refused and shown in the app, never guessed.
+- An order the extension hasn't picked up within 3 seconds is dropped, never placed late.
+
+**Pause / Continue** (top right) stops all new trades: paper, demo and real. Signals and learning keep running.
+
+The **Pocket Option trades** tab shows each order's account, status (sent, open, won, lost or rejected) and the profit Pocket Option reports. These can differ slightly from the paper trades because of entry timing.
+
+## Decision logs
+
+Each live candle is appended to `logs/decisions-YYYY-MM-DD.jsonl` in the data folder. Each line records the candle's prices, all 12 base signals, the chosen rule and its record, whether it traded, and the payout, mode and stake settings at the time. Settlements, Pocket Option order results and every settings change are logged there too. **Open decision logs folder** in the account card shows the folder. These logs are what's needed to review and refine the strategy later: share the folder, or point Claude at it.
+
 ## Payouts and stake sizing
 
 **Payout filter.** The bridge also reads Pocket Option's asset table, so the app knows each pair's live payout and whether it's open. Only pairs paying **85% or more** are traded (`--min-payout`). Below that, signals still show but no trade is placed. The **Payouts** tab lists every OTC currency pair by current payout. Pocket Option only streams prices for pairs you open, so open a high-payout pair there to trade it. Each trade is priced at the payout it opened with.
 
-**Doubling after a loss** (`--martingale`, default 4). After a loss the next stake doubles, up to 4 losses in a row (10 → 20 → 40 → 80 → 160). A win, or a fifth loss in a row, goes back to the base stake. You can change it in the app under *After a loss*, or turn it off.
+**Amount and multiplier after a loss** (`--stake`, `--martingale` default 4, `--martingale-mult` default 2.1). After a loss the next amount is multiplied by 2.1, up to 4 losses in a row (10 → 21 → 44.10 → 92.61 → 194.48). A win, or a fifth loss in a row, goes back to the base amount. You can change all three in the app's account card, or set *After a loss* to keep the same amount.
 
-What it does and doesn't do (6 simulated runs × 20,000 candles each, $10 base stake):
+At an 85% payout, 2.1× recovers the earlier losses if the win comes within 3 losses. Five losses in a row cost 36.2× the base amount.
+
+What multiplying does and doesn't do (6 simulated runs × 20,000 candles each, $10 base stake, ×2):
 
 | feed | payout | doubling | win rate | return per $ staked | worst drawdown | runs that lost 90%+ of $1,000 |
 |---|---|---|---|---|---|---|

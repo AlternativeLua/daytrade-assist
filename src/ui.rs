@@ -7,13 +7,13 @@ use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use crate::candle::Candle;
-use crate::feed::{AssetCache, Input, Registry, Tick, now_ms, parse_line};
+use crate::feed::{AssetCache, Input, Registry, SettingsChange, Tick, TradeMode, now_ms, parse_line};
 use crate::latency::Histogram;
 use crate::paper::{Outcome, Settlement};
 use crate::strategy::{EXPERTS, Pick, Record, Side, Signal, expert_name};
@@ -24,6 +24,11 @@ const MAX_JOURNAL: usize = 50_000;
 /// A batch with more events than this is sent as one snapshot instead.
 const SNAPSHOT_AFTER: usize = 200;
 const MAX_BODY: usize = 32 << 20;
+/// An order not picked up by the bridge within this long is dropped, never placed late.
+const ORDER_TTL_MS: i64 = 3_000;
+const MAX_ORDERS: usize = 500;
+/// The UI must send this exact text to switch real-money trading on.
+pub const REAL_MONEY_CONFIRMATION: &str = "I accept the risk of losing real money";
 
 pub struct UiConfig {
     pub addr: String,
@@ -91,11 +96,52 @@ pub enum Event {
         balance: f64,
     },
     Status(Status),
+    OrderSent(OrderSent),
+}
+
+/// An order handed to the bridge for the Pocket Option demo account.
+#[derive(Clone, Debug)]
+pub struct OrderSent {
+    pub account: TradeMode,
+    pub request_id: String,
+    pub asset: String,
+    pub call: bool,
+    pub amount: f64,
+    pub expiry_secs: i64,
+    pub time_ms: i64,
+}
+
+/// Orders waiting for the bridge, which long-polls `/bridge/orders`.
+#[derive(Default)]
+pub struct OrderQueue {
+    q: Mutex<VecDeque<(i64, String)>>,
+    cv: Condvar,
+}
+
+impl OrderQueue {
+    fn push(&self, line: String) {
+        self.q.lock().unwrap().push_back((now_ms(), line));
+        self.cv.notify_all();
+    }
+
+    /// Waits up to `timeout` for orders, dropping any that went stale.
+    fn take(&self, timeout: Duration) -> Vec<String> {
+        let q = self.q.lock().unwrap();
+        let (mut q, _) = self.cv.wait_timeout_while(q, timeout, |q| q.is_empty()).unwrap();
+        let fresh = now_ms() - ORDER_TTL_MS;
+        q.drain(..).filter(|(t, _)| *t >= fresh).map(|(_, line)| line).collect()
+    }
 }
 
 /// Trading conditions for the active pair: payout gate and stake sizing.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Status {
+    pub mode: TradeMode,
+    pub paused: bool,
+    pub loss_limit: f64,
+    pub real_pnl: f64,
+    pub stop_reason: Option<String>,
+    pub stake: f64,
     pub payout: Option<f64>,
     pub open: bool,
     pub can_trade: bool,
@@ -105,6 +151,87 @@ pub struct Status {
     pub steps: u32,
     pub mult: f64,
     pub z: f64,
+}
+
+/// A real order on the Pocket Option demo account, from sending to settling.
+struct PoOrder {
+    account: TradeMode,
+    request_id: String,
+    time_ms: i64,
+    asset: String,
+    call: bool,
+    amount: f64,
+    expiry_secs: i64,
+    status: &'static str,
+    deal_id: String,
+    open_price: Option<f64>,
+    close_price: Option<f64>,
+    profit: Option<f64>,
+    error: String,
+}
+
+impl PoOrder {
+    fn json(&self) -> String {
+        let opt = |x: Option<f64>| x.map_or("null".into(), num);
+        format!(
+            r#"{{"account":"{}","requestId":"{}","time":{},"asset":"{}","side":"{}","amount":{},"expiry":{},"status":"{}","dealId":"{}","openPrice":{},"closePrice":{},"profit":{},"error":"{}"}}"#,
+            self.account.name(),
+            escape(&self.request_id),
+            self.time_ms,
+            escape(&self.asset),
+            if self.call { "CALL" } else { "PUT" },
+            num(self.amount),
+            self.expiry_secs,
+            self.status,
+            escape(&self.deal_id),
+            opt(self.open_price),
+            opt(self.close_price),
+            opt(self.profit),
+            escape(&self.error),
+        )
+    }
+}
+
+/// Every live candle's inputs and decision, settlements, order results and
+/// setting changes, one JSON object per line in a file per UTC day. Meant for
+/// reviewing and refining the strategy later.
+struct DecisionLog {
+    dir: std::path::PathBuf,
+    day: i64,
+    file: Option<io::BufWriter<File>>,
+}
+
+impl DecisionLog {
+    fn write(&mut self, ts_ms: i64, line: &str) {
+        let day = ts_ms.div_euclid(86_400_000);
+        if self.file.is_none() || day != self.day {
+            self.day = day;
+            let _ = std::fs::create_dir_all(&self.dir);
+            let path = self.dir.join(format!("decisions-{}.jsonl", ymd(day)));
+            self.file = OpenOptions::new().create(true).append(true).open(path).ok().map(io::BufWriter::new);
+        }
+        if let Some(f) = &mut self.file {
+            let _ = writeln!(f, "{line}").and_then(|_| f.flush());
+        }
+    }
+}
+
+/// Days since 1970-01-01 as `YYYY-MM-DD` (proleptic Gregorian).
+fn ymd(days: i64) -> String {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn logs_dir(journal: &Option<String>) -> Option<std::path::PathBuf> {
+    journal.as_ref().map(|j| std::path::Path::new(j).with_file_name("logs"))
 }
 
 /// One row of the broker's asset table.
@@ -121,11 +248,14 @@ enum Msg {
     Client(TcpStream),
     Bridge(usize),
     Market(Vec<MarketRow>),
+    /// Order results reported by the bridge: `opened|failed|closed,...` rows.
+    OrderResults(Vec<Vec<String>>),
 }
 
 #[derive(Clone)]
 pub struct Ui {
     tx: Sender<Msg>,
+    orders: Arc<OrderQueue>,
 }
 
 struct Shared {
@@ -133,31 +263,50 @@ struct Shared {
     registry: Arc<Registry>,
     input: SyncSender<Input>,
     hub: Sender<Msg>,
+    orders: Arc<OrderQueue>,
     extension_dir: Option<String>,
+    logs_dir: Option<std::path::PathBuf>,
 }
 
 impl Ui {
     pub fn start(cfg: UiConfig, registry: Arc<Registry>, input: SyncSender<Input>) -> io::Result<Self> {
         let listener = TcpListener::bind(&cfg.addr)?;
         let (tx, rx) = mpsc::channel();
+        let orders = Arc::new(OrderQueue::default());
         let shared = Arc::new(Shared {
             addr: cfg.addr.clone(),
             registry,
             input,
             hub: tx.clone(),
+            orders: orders.clone(),
             extension_dir: cfg.extension_dir.clone(),
+            logs_dir: logs_dir(&cfg.journal),
         });
         let hub = Hub::new(cfg)?;
         thread::Builder::new().name("ui-hub".into()).spawn(move || hub.run(rx))?;
         thread::Builder::new()
             .name("ui-http".into())
             .spawn(move || serve(listener, shared))?;
-        Ok(Self { tx })
+        Ok(Self { tx, orders })
     }
 
     #[inline]
     pub fn send(&self, e: Event) {
         let _ = self.tx.send(Msg::Event(Box::new(e)));
+    }
+
+    /// Hands an order to the bridge and shows it in the UI.
+    pub fn place_order(&self, o: OrderSent) {
+        self.orders.push(format!(
+            "order,{},{},{},{},{},{}",
+            o.request_id,
+            o.asset,
+            if o.call { "call" } else { "put" },
+            o.amount,
+            o.expiry_secs,
+            o.account.name()
+        ));
+        self.send(Event::OrderSent(o));
     }
 }
 
@@ -252,6 +401,15 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
                 let n = ingest_assets(&body, shared);
                 return respond(&mut stream, "200 OK", "text/plain", &n.to_string());
             }
+            if body.starts_with("orders") {
+                let rows: Vec<Vec<String>> = body
+                    .lines()
+                    .skip(1)
+                    .map(|l| l.split(',').map(|f| f.trim().to_owned()).collect())
+                    .collect();
+                let _ = shared.hub.send(Msg::OrderResults(rows));
+                return respond(&mut stream, "200 OK", "text/plain", "ok");
+            }
             let n = ingest(&body, shared);
             let _ = shared.hub.send(Msg::Bridge(n));
             respond(&mut stream, "200 OK", "text/plain", &n.to_string())
@@ -268,11 +426,41 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
                 _ => respond(&mut stream, "400 Bad Request", "text/plain", "unknown asset or timeframe"),
             }
         }
+        ("GET", "/bridge/orders") if from_extension => {
+            let orders = shared.orders.take(Duration::from_secs(20));
+            if orders.is_empty() {
+                stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+            } else {
+                respond(&mut stream, "200 OK", "text/plain", &orders.join("\n"))
+            }
+        }
         ("POST", "/api/settings") if from_ui => {
             let form = parse_form(&String::from_utf8_lossy(&req.body));
-            let martingale_steps = form.get("martingale").and_then(|v| v.parse::<u32>().ok()).filter(|n| *n <= 8);
-            let z = form.get("z").and_then(|v| v.parse::<f64>().ok()).filter(|z| (0.0..=4.0).contains(z));
-            let _ = shared.input.send(Input::Settings { martingale_steps, z });
+            let num = |k: &str| form.get(k).and_then(|v| v.parse::<f64>().ok()).filter(|x| x.is_finite());
+            let change = SettingsChange {
+                martingale_steps: form.get("martingale").and_then(|v| v.parse::<u32>().ok()).filter(|n| *n <= 8),
+                martingale_mult: num("mult").filter(|m| (1.0..=5.0).contains(m)),
+                z: num("z").filter(|z| (0.0..=4.0).contains(z)),
+                stake: num("stake").filter(|s| *s >= 1.0 && *s <= 1_000_000.0),
+                mode: match form.get("mode").map(String::as_str) {
+                    Some("off") => Some(TradeMode::Off),
+                    Some("demo") => Some(TradeMode::Demo),
+                    // Real money needs the confirmation text the UI only sends after two prompts.
+                    Some("real") if form.get("confirm").is_some_and(|c| c == REAL_MONEY_CONFIRMATION) => Some(TradeMode::Real),
+                    Some("real") => return respond(&mut stream, "403 Forbidden", "text/plain", "real-money trading needs confirmation"),
+                    _ => None,
+                },
+                paused: form.get("paused").map(|v| v == "1"),
+                loss_limit: num("lossLimit").filter(|l| *l > 0.0),
+            };
+            let _ = shared.input.send(Input::Settings(change));
+            respond(&mut stream, "200 OK", "text/plain", "ok")
+        }
+        ("POST", "/api/reveal-logs") if from_ui => {
+            if let Some(dir) = &shared.logs_dir {
+                let _ = std::fs::create_dir_all(dir);
+                reveal(&dir.to_string_lossy());
+            }
             respond(&mut stream, "200 OK", "text/plain", "ok")
         }
         ("POST", "/api/reveal-extension") if from_ui => {
@@ -402,6 +590,10 @@ struct Hub {
     rules: String,
     status: String,
     market: String,
+    po_orders: VecDeque<PoOrder>,
+    po_saved: VecDeque<String>,
+    po_file: Option<File>,
+    log: Option<DecisionLog>,
     balance: f64,
     signals: u32,
     lat: Histogram,
@@ -415,6 +607,23 @@ impl Hub {
     fn new(cfg: UiConfig) -> io::Result<Self> {
         let mut journal = VecDeque::new();
         let mut journal_file = None;
+        let mut po_saved = VecDeque::new();
+        let mut po_file = None;
+        let log = logs_dir(&cfg.journal).map(|dir| DecisionLog { dir, day: 0, file: None });
+        if let Some(path) = &cfg.journal {
+            let path = std::path::Path::new(path).with_file_name("pocket-option-orders.jsonl");
+            if let Ok(f) = File::open(&path) {
+                for line in BufReader::new(f).lines().map_while(Result::ok) {
+                    if line.starts_with('{') {
+                        if po_saved.len() == MAX_ORDERS {
+                            po_saved.pop_front();
+                        }
+                        po_saved.push_back(line);
+                    }
+                }
+            }
+            po_file = OpenOptions::new().create(true).append(true).open(path).ok();
+        }
         if let Some(path) = &cfg.journal {
             if let Ok(f) = File::open(path) {
                 for line in BufReader::new(f).lines().map_while(Result::ok) {
@@ -449,6 +658,10 @@ impl Hub {
             rules: "[]".into(),
             status: "null".into(),
             market: "[]".into(),
+            po_orders: VecDeque::new(),
+            po_saved,
+            po_file,
+            log,
             signals: 0,
             lat: Histogram::default(),
             bridge_last: 0,
@@ -467,6 +680,11 @@ impl Hub {
             while let Some(msg) = next.take() {
                 match msg {
                     Msg::Client(stream) => self.add_client(stream),
+                    Msg::OrderResults(rows) => {
+                        if self.apply_order_results(rows) {
+                            out.push(format!(r#"{{"type":"orders","orders":{}}}"#, self.orders_json()));
+                        }
+                    }
                     Msg::Market(rows) => {
                         self.market = market_json(rows);
                         out.push(format!(r#"{{"type":"market","market":{}}}"#, self.market));
@@ -625,6 +843,26 @@ impl Hub {
                 self.lat.record(Duration::from_nanos(ns));
                 self.signals += sig.side.is_some() as u32;
                 self.signal = self.signal_json(&sig, candle.slot);
+                if let Some(log) = &mut self.log {
+                    let t = candle.slot * self.period_ms;
+                    let bases: Vec<String> = sig.bases.iter().map(i8::to_string).collect();
+                    let line = format!(
+                        r#"{{"type":"candle","t":{t},"asset":"{}","tf":{},"o":{},"h":{},"l":{},"c":{},"ticks":{},"signal":{},"bases":[{}],"traded":{},"entry":{},"ns":{ns},"status":{}}}"#,
+                        escape(&self.asset),
+                        self.period_ms / 1000,
+                        num(candle.open),
+                        num(candle.high),
+                        num(candle.low),
+                        num(candle.close),
+                        candle.ticks,
+                        self.signal,
+                        bases.join(","),
+                        entry.is_some(),
+                        entry.map_or("null".into(), |(p, _)| num(p)),
+                        self.status,
+                    );
+                    log.write(t, &line);
+                }
                 self.preview = "null".into();
                 if let (Some((price, slot)), Some(side), Some(pick)) = (entry, sig.side, sig.best) {
                     self.open = format!(
@@ -646,9 +884,37 @@ impl Hub {
                     self.stats_json(),
                 ))
             }
+            Event::OrderSent(o) => {
+                if self.po_orders.len() == MAX_ORDERS {
+                    self.po_orders.pop_front();
+                }
+                self.po_orders.push_back(PoOrder {
+                    account: o.account,
+                    request_id: o.request_id,
+                    time_ms: o.time_ms,
+                    asset: o.asset,
+                    call: o.call,
+                    amount: o.amount,
+                    expiry_secs: o.expiry_secs,
+                    status: "sent",
+                    deal_id: String::new(),
+                    open_price: None,
+                    close_price: None,
+                    profit: None,
+                    error: String::new(),
+                });
+                Some(format!(r#"{{"type":"orders","orders":{}}}"#, self.orders_json()))
+            }
             Event::Status(st) => {
+                let previous = std::mem::take(&mut self.status);
                 self.status = format!(
-                    r#"{{"payout":{},"open":{},"canTrade":{},"minPayout":{},"nextStake":{},"step":{},"steps":{},"mult":{},"z":{}}}"#,
+                    r#"{{"mode":"{}","paused":{},"lossLimit":{},"realPnl":{},"stopReason":{},"stake":{},"payout":{},"open":{},"canTrade":{},"minPayout":{},"nextStake":{},"step":{},"steps":{},"mult":{},"z":{}}}"#,
+                    st.mode.name(),
+                    st.paused,
+                    num(st.loss_limit),
+                    num(st.real_pnl),
+                    st.stop_reason.as_deref().map_or("null".into(), |r| format!("\"{}\"", escape(r))),
+                    num(st.stake),
                     st.payout.map_or("null".into(), num),
                     st.open,
                     st.can_trade,
@@ -659,6 +925,11 @@ impl Hub {
                     num(st.mult),
                     num(st.z),
                 );
+                if self.status != previous {
+                    if let Some(log) = &mut self.log {
+                        log.write(now_ms(), &format!(r#"{{"type":"status","t":{},"status":{}}}"#, now_ms(), self.status));
+                    }
+                }
                 Some(format!(r#"{{"type":"status","status":{}}}"#, self.status))
             }
             Event::Preview { slot, sig } => {
@@ -670,6 +941,9 @@ impl Hub {
                 self.open = "null".into();
                 let trade = self.trade_json(&s, rule);
                 self.trades.push(trade.clone());
+                if let Some(log) = &mut self.log {
+                    log.write(now_ms(), &format!(r#"{{"type":"settle","trade":{trade}}}"#));
+                }
                 let journaled = self.phase == Phase::Live && self.journal_file.is_some();
                 if journaled {
                     if let Some(f) = &mut self.journal_file {
@@ -735,6 +1009,75 @@ impl Hub {
         )
     }
 
+    /// Rows: `opened,requestId,dealId,openPrice`, `failed,requestId,error…`,
+    /// `closed,requestId,dealId,profit,closePrice`. Unknown orders are ignored.
+    fn apply_order_results(&mut self, rows: Vec<Vec<String>>) -> bool {
+        let mut changed = false;
+        for row in rows {
+            let field = |i: usize| row.get(i).map(String::as_str).unwrap_or("");
+            let price = |i: usize| field(i).parse::<f64>().ok().filter(|x| x.is_finite());
+            let Some(o) = self.po_orders.iter_mut().find(|o| {
+                (!field(1).is_empty() && o.request_id == field(1)) || (!field(2).is_empty() && o.deal_id == field(2))
+            }) else {
+                continue;
+            };
+            match field(0) {
+                "opened" => {
+                    o.status = "open";
+                    o.deal_id = field(2).to_owned();
+                    o.open_price = price(3);
+                }
+                "failed" => {
+                    o.status = "failed";
+                    o.error = row[2.min(row.len())..].join(", ");
+                }
+                "closed" => {
+                    let profit = price(3);
+                    o.status = match profit {
+                        Some(p) if p > 0.0 => "won",
+                        Some(p) if p < 0.0 => "lost",
+                        _ => "tie",
+                    };
+                    if !field(2).is_empty() {
+                        o.deal_id = field(2).to_owned();
+                    }
+                    o.profit = profit;
+                    o.close_price = price(4);
+                }
+                _ => continue,
+            }
+            changed = true;
+            if matches!(o.status, "failed" | "won" | "lost" | "tie") {
+                let line = o.json();
+                if let Some(log) = &mut self.log {
+                    log.write(now_ms(), &format!(r#"{{"type":"order","order":{line}}}"#));
+                }
+                if let Some(f) = &mut self.po_file {
+                    let _ = writeln!(f, "{line}").and_then(|_| f.flush());
+                }
+                if self.po_saved.len() == MAX_ORDERS {
+                    self.po_saved.pop_front();
+                }
+                self.po_saved.push_back(line);
+            }
+        }
+        changed
+    }
+
+    /// Settled orders from earlier sessions, then this session's.
+    fn orders_json(&self) -> String {
+        let mut s = String::from("[");
+        let current: Vec<String> = self.po_orders.iter().map(PoOrder::json).collect();
+        let ids: std::collections::HashSet<&str> = self.po_orders.iter().map(|o| o.request_id.as_str()).collect();
+        let earlier = self
+            .po_saved
+            .iter()
+            .filter(|l| !ids.iter().any(|id| l.contains(&format!(r#""requestId":"{id}""#))));
+        join(&mut s, earlier.cloned().chain(current));
+        s.push(']');
+        s
+    }
+
     fn stats_json(&self) -> String {
         format!(
             r#"{{"balance":{},"signals":{},"candles":{},"p50":{},"p99":{},"max":{}}}"#,
@@ -757,7 +1100,7 @@ impl Hub {
         let opt = |v: &Option<String>| v.as_deref().map_or("null".into(), |p| format!("\"{}\"", escape(p)));
         let _ = write!(
             s,
-            r#"{{"type":"snapshot","config":{{"stake":{},"payout":{},"balance":{},"z":{},"minSamples":{},"journal":{},"extensionDir":{},"session":{}}},"phase":"{}","asset":"{}","tf":{},"assets":{},"bridge":{},"backtest":{},"status":{},"market":{},"candles":["#,
+            r#"{{"type":"snapshot","config":{{"stake":{},"payout":{},"balance":{},"z":{},"minSamples":{},"journal":{},"extensionDir":{},"session":{}}},"phase":"{}","asset":"{}","tf":{},"assets":{},"bridge":{},"backtest":{},"status":{},"market":{},"orders":{},"candles":["#,
             num(c.stake),
             num(c.payout),
             num(c.balance),
@@ -774,6 +1117,7 @@ impl Hub {
             self.backtest,
             self.status,
             self.market,
+            self.orders_json(),
         );
         join(&mut s, self.candles.iter().map(|c| self.candle_json(c)));
         let forming = self
@@ -885,6 +1229,13 @@ fn rules_json(records: &[Record; EXPERTS]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dates() {
+        assert_eq!(ymd(0), "1970-01-01");
+        assert_eq!(ymd(20_750), "2026-10-24");
+        assert_eq!(ymd(11_016), "2000-02-29");
+    }
 
     #[test]
     fn decodes_forms() {

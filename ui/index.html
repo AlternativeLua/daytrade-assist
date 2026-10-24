@@ -78,7 +78,25 @@
   .gate { display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 7px 10px; border-radius: 8px; background: var(--panel-2); font-size: 12px; }
   .gate.ok { color: var(--up); } .gate.no { color: var(--warn); background: var(--warn-soft); }
   .settings { display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center; margin-top: 12px; font-size: 12px; color: var(--muted); }
-  .settings select { width: 100%; font-size: 12px; padding: 4px 6px; }
+  .settings select, .settings input { width: 100%; font-size: 12px; padding: 4px 6px; background: var(--panel-2); color: var(--text); border: 1px solid var(--line-2); border-radius: 6px; font-family: inherit; }
+  .tag.sent, .tag.open { color: var(--accent); background: var(--accent-soft); }
+  .pill.realpill { color: #fff; background: var(--down); border-color: transparent; }
+  .pausebtn { background: var(--panel-2); color: var(--text); border: 1px solid var(--line-2); border-radius: 7px; padding: 5px 12px; font-weight: 700; cursor: pointer; font-size: 12px; }
+  .pausebtn.paused { background: var(--warn); color: #111; border-color: transparent; }
+  .realbar { display: none; background: var(--down); color: #fff; padding: 7px 18px; font-weight: 600; font-size: 12px; text-align: center; }
+  .realbar.on { display: block; }
+  .stopbar { display: none; background: var(--warn-soft); color: var(--warn); padding: 7px 18px; font-weight: 600; font-size: 12px; text-align: center; }
+  .stopbar.on { display: block; }
+  .risk { margin: 0 0 12px; padding-left: 18px; }
+  .risk li { margin-bottom: 6px; }
+  .confirm-row { display: flex; gap: 8px; align-items: center; margin: 10px 0; }
+  .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+  .btn.danger { background: var(--down); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .dlg-body input[type=text], .dlg-body input[type=number] { background: var(--panel-2); color: var(--text); border: 1px solid var(--line-2); border-radius: 6px; padding: 6px 8px; font: inherit; width: 100%; }
+  .tag.won { color: var(--up); background: var(--up-soft); }
+  .tag.lost, .tag.failed { color: var(--down); background: var(--down-soft); }
+  .tag.tie { color: var(--warn); background: var(--warn-soft); }
   .warnbox { margin-top: 8px; font-size: 11px; color: var(--warn); line-height: 1.4; }
   .pay { font-weight: 700; }
   .pay.hi { color: var(--up); } .pay.lo { color: var(--faint); }
@@ -152,10 +170,14 @@
   <select id="assetSel" title="Currency pair"></select>
   <div class="seg" id="tfSeg"></div>
   <span class="pill" id="phase">connecting</span>
+  <span class="pill realpill" id="realPill" style="display:none">REAL MONEY</span>
   <span class="spacer"></span>
+  <button class="pausebtn" id="pauseBtn">Pause</button>
   <button class="bridge" id="bridgeBtn"><span class="dot" id="bridgeDot"></span><span id="bridgeText">Connect Pocket Option</span></button>
   <span class="conn hide-sm"><span class="dot" id="dot"></span><span id="connText">offline</span></span>
 </header>
+<div class="realbar" id="realBar"></div>
+<div class="stopbar" id="stopBar"></div>
 
 <main>
   <div class="card chart-card">
@@ -202,13 +224,22 @@
       </div>
       <div class="gate" id="gate"></div>
       <div class="settings">
+        <span>Amount per trade</span>
+        <input id="setStake" type="number" min="1" step="1" inputmode="decimal">
         <span>After a loss</span>
         <select id="setMart">
-          <option value="0">Keep the same stake</option>
-          <option value="1">Double, up to 1 time</option>
-          <option value="2">Double, up to 2 times</option>
-          <option value="3">Double, up to 3 times</option>
-          <option value="4">Double, up to 4 times</option>
+          <option value="0">Keep the same amount</option>
+          <option value="1">Multiply, up to 1 time</option>
+          <option value="2">Multiply, up to 2 times</option>
+          <option value="3">Multiply, up to 3 times</option>
+          <option value="4">Multiply, up to 4 times</option>
+        </select>
+        <span>Multiplier</span>
+        <select id="setMult">
+          <option value="2">×2</option>
+          <option value="2.1">×2.1</option>
+          <option value="2.2">×2.2</option>
+          <option value="2.5">×2.5</option>
         </select>
         <span>Selectivity</span>
         <select id="setZ">
@@ -217,7 +248,14 @@
           <option value="1.5">Strict</option>
           <option value="2">Very strict (fewest signals)</option>
         </select>
+        <span>Pocket Option</span>
+        <select id="setMode">
+          <option value="off">Signals only (paper trades)</option>
+          <option value="demo">Place trades on demo account</option>
+          <option value="real">Place trades with REAL money…</option>
+        </select>
       </div>
+      <div class="note"><a href="#" id="logsLink" style="color:var(--muted)">Open decision logs folder</a></div>
       <div class="warnbox" id="martWarn"></div>
       <div class="note num" id="backtest"></div>
       <div class="note num" id="lat"></div>
@@ -228,6 +266,7 @@
     <div class="tabbar">
       <button data-tab="session" class="on">Session trades<span class="count" id="nSession"></span></button>
       <button data-tab="history">History<span class="count" id="nHistory"></span></button>
+      <button data-tab="po">Pocket Option trades<span class="count" id="nPo"></span></button>
       <button data-tab="payouts">Payouts<span class="count" id="nPayouts"></span></button>
       <button data-tab="rules">Rules</button>
     </div>
@@ -264,6 +303,14 @@
       <div class="note" id="journalPath"></div>
     </div>
 
+    <div class="pane" id="tab-po">
+      <div class="tiles" id="poTiles"></div>
+      <div class="scroll"><table><thead><tr>
+        <th>Date / time</th><th>Account</th><th>Pair</th><th>Side</th><th class="r">Amount</th><th class="r">Expiry</th><th>Status</th><th class="r">Open</th><th class="r">Close</th><th class="r">Profit</th>
+      </tr></thead><tbody id="poRows"></tbody></table></div>
+      <div class="note">Orders placed on your Pocket Option account when trading is turned on in the Paper account card. Results come from Pocket Option itself, so they can differ slightly from the app's paper trades (entry timing and price).</div>
+    </div>
+
     <div class="pane" id="tab-payouts">
       <div class="scroll"><table><thead><tr>
         <th>Pair</th><th class="r">Payout</th><th class="r">Break-even</th><th>Status</th><th>Prices here</th>
@@ -280,13 +327,34 @@
   </section>
 </main>
 
+<dialog id="realDlg1">
+  <div class="dlg-head"><h2>Trade with real money?</h2><button class="x" data-close aria-label="Close">×</button></div>
+  <div class="dlg-body">
+    <p style="margin-top:0">Every signal the app trades will be placed as a real order on your Pocket Option <b>real-money</b> account.</p>
+    <ul class="risk" id="riskList"></ul>
+    <label>Stop real trading after losing
+      <input type="number" id="lossLimit" min="1" step="1"></label>
+    <div class="confirm-row"><input type="checkbox" id="riskAck"><label for="riskAck">I understand I can lose this money and that the app's past results don't predict future ones.</label></div>
+    <div class="dlg-actions"><button class="btn ghost" data-close>Cancel</button><button class="btn danger" id="real1Next" disabled>Continue</button></div>
+  </div>
+</dialog>
+
+<dialog id="realDlg2">
+  <div class="dlg-head"><h2>Second confirmation</h2><button class="x" data-close aria-label="Close">×</button></div>
+  <div class="dlg-body">
+    <p style="margin-top:0">Type <b>REAL</b> to turn on real-money trading. It turns itself off when the app restarts, when you pause, or when losses reach <b id="limitEcho"></b>.</p>
+    <input type="text" id="realWord" autocomplete="off" placeholder="REAL">
+    <div class="dlg-actions"><button class="btn ghost" data-close>Cancel</button><button class="btn danger" id="real2Go" disabled>Turn on real-money trading</button></div>
+  </div>
+</dialog>
+
 <dialog id="connectDlg">
   <div class="dlg-head"><h2>Connect Pocket Option</h2><button class="x" id="dlgClose" aria-label="Close">×</button></div>
   <div class="dlg-body">
     <div class="status-line"><span class="dot" id="dlgDot"></span><span id="dlgStatus"></span></div>
-    <p style="margin-top:0">A small Chrome extension forwards the prices your logged-in Pocket Option tab already receives to this app. It only reads prices: it never sees your password and never places trades.</p>
+    <p style="margin-top:0">A small Chrome extension forwards the prices and payouts your logged-in Pocket Option tab already receives to this app. It never sees your password. It only places trades when you turn on <b>Place trades on demo account</b>, and only on a tab logged in to the demo account.</p>
     <ol>
-      <li>In Chrome, open <code>chrome://extensions</code> and turn on <b>Developer mode</b> (top right).</li>
+      <li>In Chrome, open <code>chrome://extensions</code> and turn on <b>Developer mode</b> (top right). If you loaded an older version, click its reload button instead and skip step 2.</li>
       <li>Click <b>Load unpacked</b> and choose this folder:
         <div class="path"><span id="extPath" style="flex:1">—</span><button class="btn ghost" id="revealBtn">Show folder</button></div>
       </li>
@@ -300,7 +368,7 @@
 <script>
 const $ = id => document.getElementById(id);
 const TIMEFRAMES = [15, 30, 60, 120, 300, 900];
-const S = { cfg: null, phase: 'connecting', asset: '', tf: 60, assets: [], bridge: { last: 0, ticks: 0 }, backtest: null, status: null, market: [],
+const S = { cfg: null, phase: 'connecting', asset: '', tf: 60, assets: [], bridge: { last: 0, ticks: 0 }, backtest: null, status: null, market: [], orders: [],
   candles: [], forming: null, trades: [], journal: [], rules: [], stats: {}, signal: null, open: null, preview: null, lastTs: 0, recvAt: 0 };
 
 const css = getComputedStyle(document.documentElement);
@@ -426,7 +494,7 @@ function connect() {
 function handle(m) {
   switch (m.type) {
     case 'snapshot':
-      Object.assign(S, { cfg: m.config, phase: m.phase, asset: m.asset, tf: m.tf, assets: m.assets, bridge: m.bridge, backtest: m.backtest, status: m.status, market: m.market,
+      Object.assign(S, { cfg: m.config, phase: m.phase, asset: m.asset, tf: m.tf, assets: m.assets, bridge: m.bridge, backtest: m.backtest, status: m.status, market: m.market, orders: m.orders || [],
         candles: m.candles, trades: m.trades, journal: m.journal, rules: m.rules, stats: m.stats, signal: m.signal, open: m.open, preview: m.preview });
       S.forming = m.forming ? m.forming.c : null;
       if (m.forming) { S.lastTs = m.forming.ts; S.recvAt = Date.now(); }
@@ -465,6 +533,9 @@ function handle(m) {
     case 'status':
       S.status = m.status; renderAccount(); renderSignal();
       break;
+    case 'orders':
+      S.orders = m.orders; renderOrders();
+      break;
     case 'market':
       S.market = m.market; assetKey = ''; renderAssets(); renderPayouts(); renderAccount();
       break;
@@ -486,7 +557,7 @@ function safeUpdate(b) { try { series.update(b); } catch { series.setData(allBar
 // ---------- render ----------
 function renderAll() {
   renderHeader(); renderAssets(); renderBridge(); renderOverlay();
-  renderPrice(); renderSignal(); renderAccount(); renderMarkers(); renderSession(); renderRules(); renderHistory(); renderPayouts();
+  renderPrice(); renderSignal(); renderAccount(); renderMarkers(); renderSession(); renderRules(); renderHistory(); renderPayouts(); renderOrders();
 }
 
 function renderOverlay() {
@@ -565,15 +636,22 @@ function renderAccount() {
   const s2 = S.status, gate = $('gate');
   if (s2) {
     const stake = s2.steps ? ` · next stake ${s2.nextStake.toFixed(2)}${s2.step ? ` (after ${s2.step} loss${s2.step > 1 ? 'es' : ''})` : ''}` : ` · stake ${s2.nextStake.toFixed(2)}`;
-    gate.className = 'gate ' + (s2.canTrade ? 'ok' : 'no');
-    gate.textContent = s2.canTrade ? `Payout ${pct0(s2.payout)} · trading${stake}` : `Not trading: ${gateReason()}`;
-    if (document.activeElement !== $('setMart')) $('setMart').value = String(s2.steps);
-    if (document.activeElement !== $('setZ')) $('setZ').value = String(s2.z);
+    const where = s2.mode === 'off' ? '' : isDemo(S.asset) ? ' · demo pair, paper only' : s2.mode === 'real' ? ' · placing REAL-money orders' : ' · placing on Pocket Option demo';
+    gate.className = 'gate ' + (s2.canTrade && !s2.paused ? 'ok' : 'no');
+    gate.textContent = s2.paused ? 'Paused · no new trades (signals and learning continue)'
+      : s2.canTrade ? `Payout ${pct0(s2.payout)} · trading${stake}${where}` : `Not trading: ${gateReason()}`;
+    renderMode();
+    const keep = (id, v) => { if (document.activeElement !== $(id)) $(id).value = v; };
+    keep('setMart', String(s2.steps)); keep('setZ', String(s2.z)); keep('setMult', String(s2.mult));
+    keep('setStake', String(s2.stake)); keep('setMode', s2.mode);
+    $('setMult').disabled = !s2.steps;
     const p = s2.payout ?? S.cfg.payout, m = s2.mult;
     let lose = 0, losing = null;
     for (let k = 0; k <= s2.steps; k++) { if (losing == null && p * m ** k < lose + 1e-9) losing = k; lose += m ** k; }
-    $('martWarn').textContent = s2.steps ? `At ${pct0(p)} payout, a win only recovers earlier losses within ${losing == null ? s2.steps : losing - 1} loss${(losing ?? s2.steps + 1) - 1 === 1 ? '' : 'es'}. ` +
-      `${s2.steps + 1} losses in a row cost ${(lose * S.cfg.stake).toFixed(2)} (${lose}× the base stake). Doubling changes the size of wins and losses, not the win rate.` : '';
+    const within = losing == null ? s2.steps : losing - 1;
+    $('martWarn').textContent = s2.steps ? `At ${pct0(p)} payout with ×${m}, ` +
+      (losing == null ? `a win recovers all earlier losses in the run. ` : `a win only recovers earlier losses if it comes within ${within} loss${within === 1 ? '' : 'es'}. `) +
+      `${s2.steps + 1} losses in a row cost ${(lose * s2.stake).toFixed(2)} (${+lose.toFixed(2)}× the base amount). Multiplying changes the size of wins and losses, not the win rate.` : '';
   } else gate.textContent = '';
 }
 
@@ -603,8 +681,104 @@ $('payoutRows').addEventListener('click', e => {
   const tr = e.target.closest('tr.click');
   if (tr && tr.dataset.asset !== S.asset) select(tr.dataset.asset, S.tf);
 });
-$('setMart').addEventListener('change', e => fetch('/api/settings', { method: 'POST', body: new URLSearchParams({ martingale: e.target.value }) }).catch(() => {}));
-$('setZ').addEventListener('change', e => fetch('/api/settings', { method: 'POST', body: new URLSearchParams({ z: e.target.value }) }).catch(() => {}));
+const setting = (k, v) => fetch('/api/settings', { method: 'POST', body: new URLSearchParams({ [k]: v }) }).catch(() => {});
+$('setMart').addEventListener('change', e => setting('martingale', e.target.value));
+$('setMult').addEventListener('change', e => setting('mult', e.target.value));
+$('setZ').addEventListener('change', e => setting('z', e.target.value));
+$('setStake').addEventListener('change', e => { const v = Number(e.target.value); if (v >= 1) setting('stake', v); });
+const REAL_CONFIRMATION = 'I accept the risk of losing real money';
+$('setMode').addEventListener('change', e => {
+  const v = e.target.value;
+  e.target.value = S.status ? S.status.mode : 'off';
+  if (v === 'off') return setting('mode', 'off');
+  if (v === 'demo') {
+    if (confirm('Place the app\'s signals as orders on your Pocket Option DEMO account?\n\nOrders are only placed when the Pocket Option tab is logged in to the demo account.')) setting('mode', 'demo');
+    return;
+  }
+  openRealDialog();
+});
+
+function openRealDialog() {
+  const st = S.status, base = st.stake, m = st.mult, steps = st.steps;
+  const amounts = Array.from({ length: steps + 1 }, (_, k) => base * m ** k);
+  const run = amounts.reduce((a, b) => a + b, 0);
+  $('riskList').innerHTML = [
+    `EU and UK regulators ban binary options for retail traders because most of them lose money. Pocket Option is not licensed by any major financial regulator.`,
+    `The strategy has no proven edge on real Pocket Option prices yet. Your demo results so far: <b>${esc(demoSummary())}</b>.`,
+    steps ? `With ${base.toFixed(2)} per trade and ×${m} after a loss, a run of ${steps + 1} losses stakes ${amounts.map(a => a.toFixed(2)).join(' → ')} and loses <b>${run.toFixed(2)}</b>. That happens more often than it feels like it should.`
+          : `Each trade stakes ${base.toFixed(2)}.`,
+    `Pocket Option doesn't support third-party trading tools, and may restrict accounts that use them.`,
+  ].map(x => `<li>${x}</li>`).join('');
+  $('lossLimit').value = st.lossLimit;
+  $('riskAck').checked = false;
+  $('real1Next').disabled = true;
+  $('realDlg1').showModal();
+}
+function demoSummary() {
+  const done = S.orders.filter(o => o.account === 'demo' && ['won', 'lost'].includes(o.status));
+  if (!done.length) return 'no settled demo-account orders';
+  const won = done.filter(o => o.status === 'won').length;
+  const profit = done.reduce((a, o) => a + (o.profit || 0), 0);
+  return `${done.length} orders, ${pct(won / done.length)} won, ${fmtMoney(profit)}`;
+}
+$('riskAck').addEventListener('change', () => { $('real1Next').disabled = !($('riskAck').checked && Number($('lossLimit').value) > 0); });
+$('lossLimit').addEventListener('input', () => { $('real1Next').disabled = !($('riskAck').checked && Number($('lossLimit').value) > 0); });
+$('real1Next').addEventListener('click', () => {
+  $('realDlg1').close();
+  $('limitEcho').textContent = Number($('lossLimit').value).toFixed(2);
+  $('realWord').value = '';
+  $('real2Go').disabled = true;
+  $('realDlg2').showModal();
+});
+$('realWord').addEventListener('input', e => { $('real2Go').disabled = e.target.value.trim() !== 'REAL'; });
+$('real2Go').addEventListener('click', () => {
+  $('realDlg2').close();
+  fetch('/api/settings', { method: 'POST', body: new URLSearchParams({ mode: 'real', lossLimit: $('lossLimit').value, confirm: REAL_CONFIRMATION }) }).catch(() => {});
+});
+document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => b.closest('dialog').close()));
+
+$('pauseBtn').addEventListener('click', () => {
+  const pause = !(S.status && S.status.paused);
+  // Pausing also switches real money off, so continuing never resumes it silently.
+  const body = pause && S.status && S.status.mode === 'real' ? { paused: '1', mode: 'off' } : { paused: pause ? '1' : '0' };
+  fetch('/api/settings', { method: 'POST', body: new URLSearchParams(body) }).catch(() => {});
+});
+$('logsLink').addEventListener('click', e => { e.preventDefault(); fetch('/api/reveal-logs', { method: 'POST' }).catch(() => {}); });
+
+function renderMode() {
+  const st = S.status;
+  if (!st) return;
+  const real = st.mode === 'real';
+  $('realPill').style.display = real ? '' : 'none';
+  $('realBar').className = 'realbar' + (real ? ' on' : '');
+  $('realBar').textContent = real ? `REAL-MONEY TRADING IS ON · stops after losing ${st.lossLimit.toFixed(2)} · so far ${fmtMoney(st.realPnl)} on paper-matched trades · Pause turns it off` : '';
+  $('stopBar').className = 'stopbar' + (st.stopReason ? ' on' : '');
+  $('stopBar').textContent = st.stopReason ? st.stopReason.charAt(0).toUpperCase() + st.stopReason.slice(1) : '';
+  $('pauseBtn').textContent = st.paused ? 'Continue' : 'Pause';
+  $('pauseBtn').className = 'pausebtn' + (st.paused ? ' paused' : '');
+}
+
+function renderOrders() {
+  const list = S.orders.slice().sort((a, b) => b.time - a.time);
+  const done = list.filter(o => ['won', 'lost', 'tie'].includes(o.status));
+  const won = done.filter(o => o.status === 'won').length, lost = done.filter(o => o.status === 'lost').length;
+  const profit = done.reduce((a, o) => a + (o.profit || 0), 0);
+  $('nPo').textContent = list.length || '';
+  $('poTiles').innerHTML = [
+    ['Orders', list.length, `${list.filter(o => o.status === 'failed').length} rejected · ${list.filter(o => ['sent', 'open'].includes(o.status)).length} open`],
+    ['Win rate', pct(won + lost ? won / (won + lost) : null), `${won}W · ${lost}L`],
+    ['Profit', done.length ? fmtMoney(profit) : '—', 'as reported by Pocket Option', profit > 0 ? 'up' : profit < 0 ? 'down' : ''],
+  ].map(([k, v, sub, cls]) => `<div class="tile"><div class="k">${k}</div><div class="v num ${cls || ''}">${v}</div><div class="s">${sub}</div></div>`).join('');
+  $('poRows').innerHTML = list.length ? list.slice(0, 500).map(o => {
+    const dg = digitsFor(o.openPrice || 1);
+    return `<tr title="${esc(o.error)}"><td class="num">${new Date(o.time).toISOString().slice(0, 19).replace('T', ' ')}</td>
+      <td>${o.account === 'real' ? '<span class="tag LOSS">REAL</span>' : '<span class="muted">demo</span>'}</td><td>${esc(pairName(o.asset))}</td>
+      <td><span class="tag ${o.side}">${o.side}</span></td><td class="r num">${o.amount.toFixed(2)}</td><td class="r num">${tfLabel(o.expiry)}</td>
+      <td><span class="tag ${o.status}">${o.status.toUpperCase()}</span>${o.error ? ` <span class="muted">${esc(o.error)}</span>` : ''}</td>
+      <td class="r num">${o.openPrice != null ? fmtPx(o.openPrice, dg) : '—'}</td><td class="r num">${o.closePrice != null ? fmtPx(o.closePrice, dg) : '—'}</td>
+      <td class="r num ${o.profit > 0 ? 'up' : o.profit < 0 ? 'down' : ''}">${o.profit != null ? fmtMoney(o.profit) : '—'}</td></tr>`;
+  }).join('') : `<tr><td colspan="10" class="empty">No Pocket Option orders yet. Turn on "Place trades on demo account" in the Paper account card.</td></tr>`;
+}
 
 function renderMarkers() {
   const first = S.candles.length ? S.candles[0][0] : 0;
@@ -630,7 +804,7 @@ function tradeRow(x, full) {
   const dg = digitsFor(x.entry);
   return `<tr><td class="num">${when}</td><td>${esc(pairName(x.asset))} <span class="muted">${tfLabel(x.tf || 60)}</span></td>
     <td><span class="tag ${x.side}">${x.side}</span></td>
-    <td class="r num">${x.stake != null ? x.stake.toFixed(2) : '—'}${x.step ? `<span class="muted"> ×${2 ** x.step}</span>` : ''}</td>
+    <td class="r num">${x.stake != null ? x.stake.toFixed(2) : '—'}${x.step ? `<span class="muted"> · step ${x.step}</span>` : ''}</td>
     <td class="r num">${fmtPx(x.entry, dg)}</td><td class="r num">${fmtPx(x.exit, dg)}</td>
     <td><span class="tag ${x.outcome}">${x.outcome}</span></td>
     <td class="r num ${x.pnl > 0 ? 'up' : x.pnl < 0 ? 'down' : ''}">${fmtMoney(x.pnl)}</td>

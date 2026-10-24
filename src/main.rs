@@ -53,7 +53,8 @@ OPTIONS:
     --min-payout <F>    Don't trade pairs paying less than this [default: 0.85]
     --martingale <N>    After a loss, multiply the stake, up to N losses in a row,
                         then go back to the base stake; 0 = fixed stake [default: 4]
-    --martingale-mult <F>  Stake multiplier after each loss   [default: 2]
+    --martingale-mult <F>  Stake multiplier after each loss   [default: 2.1]
+    --loss-limit <N>    Real-money losses after which real trading turns itself off [default: 100]
     --balance <N>       Starting paper balance           [default: 1000]
     --digits <N>        Price decimals to print          [default: 5]
     --no-heads-up       Don't preview signals before the candle closes
@@ -111,6 +112,7 @@ pub struct Config {
     pub martingale_steps: u32,
     pub martingale_mult: f64,
     pub min_payout: f64,
+    pub loss_limit: f64,
     /// Live feeds must report a payout before their pairs are traded.
     pub require_payout: bool,
     demo: bool,
@@ -167,8 +169,9 @@ fn parse_args() -> Result<Config, String> {
         period_ms: 60_000,
         data_dir: bridged.then(default_data_dir),
         martingale_steps: 4,
-        martingale_mult: 2.0,
+        martingale_mult: 2.1,
         min_payout: 0.85,
+        loss_limit: 100.0,
         require_payout: bridged,
         demo: source_is_app,
         window: true,
@@ -214,6 +217,7 @@ fn parse_args() -> Result<Config, String> {
                 cfg.min_payout = as_fraction(cfg.min_payout);
             }
             "--martingale" => num!(cfg.martingale_steps),
+            "--loss-limit" => num!(cfg.loss_limit),
             "--martingale-mult" => num!(cfg.martingale_mult),
             "--balance" => num!(cfg.balance),
             "--digits" => num!(cfg.digits),

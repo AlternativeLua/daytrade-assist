@@ -26,9 +26,40 @@ pub enum Input {
     Select { asset: AssetId, period_ms: i64 },
     /// Current payout (0.92 = 92%) and whether each asset is open for trading.
     Payouts(Vec<(AssetId, f64, bool)>),
-    Settings { martingale_steps: Option<u32>, z: Option<f64> },
+    Settings(SettingsChange),
     /// A finite source (file, stdin, instant sim) has finished.
     SourceDone,
+}
+
+/// Settings changed from the UI; `None` leaves a setting as it is.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SettingsChange {
+    pub martingale_steps: Option<u32>,
+    pub martingale_mult: Option<f64>,
+    pub z: Option<f64>,
+    pub stake: Option<f64>,
+    pub mode: Option<TradeMode>,
+    pub paused: Option<bool>,
+    /// Real-money losses (in account currency) after which real trading switches itself off.
+    pub loss_limit: Option<f64>,
+}
+
+/// Where signals go besides the paper account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TradeMode {
+    Off,
+    Demo,
+    Real,
+}
+
+impl TradeMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            TradeMode::Off => "off",
+            TradeMode::Demo => "demo",
+            TradeMode::Real => "real",
+        }
+    }
 }
 
 /// Interns asset names so ticks carry a small id instead of a string.
