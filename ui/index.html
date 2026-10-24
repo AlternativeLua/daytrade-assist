@@ -380,6 +380,7 @@
       <div class="path"><span id="ffPath" style="flex:1">—</span><button class="btn ghost" data-reveal="firefox">Show folder</button></div>
       <p style="margin:8px 0 0">Then open Pocket Option and pick an OTC pair. If no prices arrive, open <code>about:addons</code> → <b>Daytrade Assist bridge</b> → <b>Permissions</b> and turn everything on.</p>
     </div>
+    <details id="diagBox" style="margin:10px 0"><summary class="muted" style="cursor:pointer">What the extension sees</summary><div id="diagList" class="fine num" style="margin-top:6px;white-space:pre-wrap"></div></details>
     <p class="fine">The extension's badge shows <b>ON</b> while it can reach the app. Keep this app running, since the extension sends to 127.0.0.1:8787. Pocket Option doesn't support third-party tools and may change its site at any time, which can stop the bridge working. This is for paper trading and research, not advice.</p>
   </div>
 </dialog>
@@ -491,10 +492,26 @@ function bridgeState() {
   if (age < 10000) return { cls: 'ok', text: 'Pocket Option', detail: `Receiving prices · ${S.bridge.ticks.toLocaleString()} ticks so far · last ${ago(S.bridge.last)}` };
   return { cls: 'warn', text: 'Pocket Option · paused', detail: `No prices for ${ago(S.bridge.last).replace(' ago', '')}. Is a Pocket Option tab open?` };
 }
+function renderDiag() {
+  const reports = (S.diag || []).map(d => { try { return { t: d.t, ...JSON.parse(d.report) }; } catch { return null; } }).filter(Boolean);
+  if (!reports.length) {
+    $('diagList').textContent = 'Nothing yet. If the extension is installed, restart the browser or reload it; it reports as soon as it starts.';
+    return;
+  }
+  $('diagList').textContent = reports.map(r => {
+    const when = ago(r.t);
+    if (r.url === 'background') return `Extension ${r.version || ''} running (${when})`;
+    const socks = (r.sockets || []).map(x => `  · socket ${x.host}: ${x.frames} frames, login ${x.login}${x.events.length ? `, events: ${x.events.slice(0, 12).join(', ')}` : ''}`);
+    const workers = (r.workers || []).map(w => `  · ${w}`);
+    return [`Page ${r.url}${r.top ? '' : ' (frame)'} (${when})`, ...(socks.length ? socks : ['  · no websockets opened in this page']), ...workers].join('\n');
+  }).join('\n');
+}
+
 function renderBridge() {
   const st = bridgeState();
   $('bridgeDot').className = 'dot ' + st.cls; $('bridgeText').textContent = st.text;
   $('dlgDot').className = 'dot ' + st.cls; $('dlgStatus').textContent = st.detail;
+  renderDiag();
   const none = 'Run the app (not the CLI) to create the extension.';
   $('extPath').textContent = S.cfg && S.cfg.extensionDir || none;
   $('xpiPath').textContent = S.cfg && S.cfg.firefoxXpi || none;
@@ -524,7 +541,7 @@ function connect() {
 function handle(m) {
   switch (m.type) {
     case 'snapshot':
-      Object.assign(S, { cfg: m.config, phase: m.phase, asset: m.asset, tf: m.tf, assets: m.assets, bridge: m.bridge, backtest: m.backtest, status: m.status, market: m.market, orders: m.orders || [],
+      Object.assign(S, { cfg: m.config, phase: m.phase, asset: m.asset, tf: m.tf, assets: m.assets, bridge: m.bridge, backtest: m.backtest, status: m.status, market: m.market, orders: m.orders || [], diag: m.diag || [],
         candles: m.candles, trades: m.trades, journal: m.journal, rules: m.rules, stats: m.stats, signal: m.signal, open: m.open, preview: m.preview });
       S.forming = m.forming ? m.forming.c : null;
       if (m.forming) { S.lastTs = m.forming.ts; S.recvAt = Date.now(); }
@@ -562,6 +579,9 @@ function handle(m) {
       break;
     case 'status':
       S.status = m.status; renderAccount(); renderSignal();
+      break;
+    case 'diag':
+      S.diag = m.diag; renderBridge();
       break;
     case 'orders':
       S.orders = m.orders; renderOrders();

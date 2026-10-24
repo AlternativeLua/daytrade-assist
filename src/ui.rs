@@ -252,6 +252,8 @@ enum Msg {
     Market(Vec<MarketRow>),
     /// Order results reported by the bridge: `opened|failed|closed,...` rows.
     OrderResults(Vec<Vec<String>>),
+    /// What the extension sees, one JSON report per page or background script.
+    Diag(Vec<String>),
 }
 
 #[derive(Clone)]
@@ -404,6 +406,11 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
             if body.starts_with("assets") {
                 let n = ingest_assets(&body, shared);
                 return respond(&mut stream, "200 OK", "text/plain", &n.to_string());
+            }
+            if body.starts_with("diag") {
+                let reports = body.lines().skip(1).map(|l| l.chars().take(4000).collect()).collect();
+                let _ = shared.hub.send(Msg::Diag(reports));
+                return respond(&mut stream, "200 OK", "text/plain", "ok");
             }
             if body.starts_with("orders") {
                 let rows: Vec<Vec<String>> = body
@@ -599,6 +606,8 @@ struct Hub {
     po_saved: VecDeque<String>,
     po_file: Option<File>,
     log: Option<DecisionLog>,
+    /// Latest extension report per page (keyed by its URL), with when it arrived.
+    diag: Vec<(String, i64, String)>,
     balance: f64,
     signals: u32,
     lat: Histogram,
@@ -667,6 +676,7 @@ impl Hub {
             po_saved,
             po_file,
             log,
+            diag: Vec::new(),
             signals: 0,
             lat: Histogram::default(),
             bridge_last: 0,
@@ -685,6 +695,17 @@ impl Hub {
             while let Some(msg) = next.take() {
                 match msg {
                     Msg::Client(stream) => self.add_client(stream),
+                    Msg::Diag(reports) => {
+                        for report in reports {
+                            let key = report.split(r#""url":""#).nth(1).and_then(|r| r.split('"').next()).unwrap_or("").to_owned();
+                            self.diag.retain(|(k, _, _)| *k != key);
+                            self.diag.push((key, now_ms(), report));
+                            if self.diag.len() > 20 {
+                                self.diag.remove(0);
+                            }
+                        }
+                        out.push(format!(r#"{{"type":"diag","diag":{}}}"#, self.diag_json()));
+                    }
                     Msg::OrderResults(rows) => {
                         if self.apply_order_results(rows) {
                             out.push(format!(r#"{{"type":"orders","orders":{}}}"#, self.orders_json()));
@@ -1069,6 +1090,14 @@ impl Hub {
         changed
     }
 
+    /// Reports are passed through as strings; the page parses them.
+    fn diag_json(&self) -> String {
+        let mut s = String::from("[");
+        join(&mut s, self.diag.iter().map(|(_, t, r)| format!(r#"{{"t":{t},"report":"{}"}}"#, escape(r))));
+        s.push(']');
+        s
+    }
+
     /// Settled orders from earlier sessions, then this session's.
     fn orders_json(&self) -> String {
         let mut s = String::from("[");
@@ -1105,7 +1134,7 @@ impl Hub {
         let opt = |v: &Option<String>| v.as_deref().map_or("null".into(), |p| format!("\"{}\"", escape(p)));
         let _ = write!(
             s,
-            r#"{{"type":"snapshot","config":{{"stake":{},"payout":{},"balance":{},"z":{},"minSamples":{},"journal":{},"extensionDir":{},"firefoxDir":{},"firefoxXpi":{},"session":{}}},"phase":"{}","asset":"{}","tf":{},"assets":{},"bridge":{},"backtest":{},"status":{},"market":{},"orders":{},"candles":["#,
+            r#"{{"type":"snapshot","config":{{"stake":{},"payout":{},"balance":{},"z":{},"minSamples":{},"journal":{},"extensionDir":{},"firefoxDir":{},"firefoxXpi":{},"session":{}}},"phase":"{}","asset":"{}","tf":{},"assets":{},"bridge":{},"backtest":{},"status":{},"market":{},"orders":{},"diag":{},"candles":["#,
             num(c.stake),
             num(c.payout),
             num(c.balance),
@@ -1125,6 +1154,7 @@ impl Hub {
             self.status,
             self.market,
             self.orders_json(),
+            self.diag_json(),
         );
         join(&mut s, self.candles.iter().map(|c| self.candle_json(c)));
         let forming = self

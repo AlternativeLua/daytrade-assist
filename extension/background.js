@@ -31,6 +31,9 @@ function encode(msg) {
   if (msg.kind === 'orders') {
     return ['orders', ...msg.rows.map((r) => r.map(clean).join(','))];
   }
+  if (msg.kind === 'diag') {
+    return ['diag', ...msg.rows.map((r) => String(r[0]).replace(/[\r\n]/g, ' '))];
+  }
   const lines = [msg.kind === 'history' ? 'history' : 'stream'];
   for (const [asset, time, price] of msg.rows) {
     if (typeof asset === 'string' && Number.isFinite(time) && Number.isFinite(price)) {
@@ -80,3 +83,5 @@ async function pollOrders() {
   }
 }
 pollOrders();
+// Lets the app show that the extension itself is running, even before any page is open.
+fetch(`${APP}/ingest`, { method: 'POST', body: `diag\n${JSON.stringify({ url: 'background', browser: navigator.userAgent, version: api.runtime.getManifest().version })}` }).catch(() => {});

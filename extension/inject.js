@@ -22,6 +22,8 @@
   const NativeWebSocket = window.WebSocket;
   const sockets = new Set();
   const placed = new Map(); // requestId -> dealId, for orders this bridge placed
+  // What this page is doing, reported to the app so problems can be diagnosed.
+  const diag = { sockets: [], workers: [] };
 
   const emit = (kind, rows) => {
     if (rows.length) window.postMessage({ [TAG]: true, kind, rows }, '*');
@@ -63,6 +65,7 @@
 
   function handleEvent(socket, name, data) {
     socket.__daLast = Date.now();
+    if (socket.__daDiag && socket.__daDiag.events.length < 40 && !socket.__daDiag.events.includes(name)) socket.__daDiag.events.push(name);
     if (name === 'successopenOrder' || name === 'successcloseOrder' || name === 'updateClosedDeals') {
       onDeals(name, data);
     } else if (name === 'failopenOrder') {
@@ -108,6 +111,7 @@
   }
 
   function onFrame(socket, text, binary) {
+    if (socket.__daDiag) socket.__daDiag.frames++;
     const msg = parseJson(text);
     if (msg === undefined) return;
     if (binary) {
@@ -162,6 +166,11 @@
     constructor(...args) {
       super(...args);
       sockets.add(this);
+      let host = '?';
+      try { host = new URL(String(args[0]), location.href).host; } catch {}
+      this.__daDiag = { host, frames: 0, events: [], login: 'none' };
+      diag.sockets.push(this.__daDiag);
+      if (diag.sockets.length > 10) diag.sockets.shift();
       this.addEventListener('close', () => sockets.delete(this));
       this.addEventListener('message', (event) => {
         const data = event.data;
@@ -180,10 +189,27 @@
         if (Array.isArray(msg) && msg[0] === 'auth' && msg[1] && typeof msg[1] === 'object') {
           this.__daAuthed = true;
           this.__daDemo = msg[1].isDemo === 1 || msg[1].isDemo === true || msg[1].isDemo === '1';
+          this.__daDiag.login = this.__daDemo ? 'demo' : 'real';
         }
       }
       return super.send(data);
     }
   }
   window.WebSocket = BridgedWebSocket;
+
+  // Note workers the page starts: a price connection inside one can't be seen from here.
+  for (const name of ['Worker', 'SharedWorker']) {
+    const Native = window[name];
+    if (typeof Native !== 'function') continue;
+    window[name] = class extends Native {
+      constructor(url, ...rest) {
+        super(url, ...rest);
+        if (diag.workers.length < 10) diag.workers.push(`${name}: ${String(url).slice(0, 120)}`);
+      }
+    };
+  }
+
+  const report = () => emit('diag', [[JSON.stringify({ url: location.origin + location.pathname, top: window === window.top, ...diag })]]);
+  report();
+  setInterval(report, 5000);
 })();
