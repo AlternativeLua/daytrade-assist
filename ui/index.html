@@ -327,6 +327,15 @@
   </section>
 </main>
 
+<dialog id="demoDlg">
+  <div class="dlg-head"><h2>Trade on the demo account?</h2><button class="x" data-close aria-label="Close">×</button></div>
+  <div class="dlg-body">
+    <p style="margin-top:0">The app's signals will be placed as orders on your Pocket Option <b>demo</b> account, using the amount and multiplier set in the Paper account card.</p>
+    <p>Orders are only placed when your Pocket Option tab is logged in to the demo account, and only on pairs paying at least the minimum payout.</p>
+    <div class="dlg-actions"><button class="btn ghost" data-close>Cancel</button><button class="btn" id="demoGo">Place trades on demo account</button></div>
+  </div>
+</dialog>
+
 <dialog id="realDlg1">
   <div class="dlg-head"><h2>Trade with real money?</h2><button class="x" data-close aria-label="Close">×</button></div>
   <div class="dlg-body">
@@ -691,7 +700,8 @@ function renderAccount() {
     gate.textContent = s2.paused ? 'Paused · no new trades (signals and learning continue)'
       : s2.canTrade ? `Payout ${pct0(s2.payout)} · trading${stake}${where}` : `Not trading: ${gateReason()}`;
     renderMode();
-    const keep = (id, v) => { if (document.activeElement !== $(id)) $(id).value = v; };
+    // Don't overwrite a number while it's being typed; drop-downs always show the live value.
+    const keep = (id, v) => { if ($(id).tagName === 'SELECT' || document.activeElement !== $(id)) $(id).value = v; };
     keep('setMart', String(s2.steps)); keep('setZ', String(s2.z)); keep('setMult', String(s2.mult));
     keep('setStake', String(s2.stake)); keep('setMode', s2.mode);
     $('setMult').disabled = !s2.steps;
@@ -741,10 +751,8 @@ $('setMode').addEventListener('change', e => {
   const v = e.target.value;
   e.target.value = S.status ? S.status.mode : 'off';
   if (v === 'off') return setting('mode', 'off');
-  if (v === 'demo') {
-    if (confirm('Place the app\'s signals as orders on your Pocket Option DEMO account?\n\nOrders are only placed when the Pocket Option tab is logged in to the demo account.')) setting('mode', 'demo');
-    return;
-  }
+  // The app window's web view doesn't show confirm() popups, so this uses its own dialog.
+  if (v === 'demo') return $('demoDlg').showModal();
   openRealDialog();
 });
 
@@ -771,6 +779,7 @@ function demoSummary() {
   const profit = done.reduce((a, o) => a + (o.profit || 0), 0);
   return `${done.length} orders, ${pct(won / done.length)} won, ${fmtMoney(profit)}`;
 }
+$('demoGo').addEventListener('click', () => { $('demoDlg').close(); setting('mode', 'demo'); });
 $('riskAck').addEventListener('change', () => { $('real1Next').disabled = !($('riskAck').checked && Number($('lossLimit').value) > 0); });
 $('lossLimit').addEventListener('input', () => { $('real1Next').disabled = !($('riskAck').checked && Number($('lossLimit').value) > 0); });
 $('real1Next').addEventListener('click', () => {
