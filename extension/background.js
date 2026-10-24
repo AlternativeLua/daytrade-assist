@@ -3,15 +3,17 @@
 // per message keeps latency to a few milliseconds; the badge shows whether the
 // app is reachable.
 const APP = 'http://127.0.0.1:8787';
+// `browser` is Firefox's name for the extension API, `chrome` everyone else's.
+const api = globalThis.browser ?? globalThis.chrome;
 const tabs = new Map(); // asset -> { tabId, frameId }
 let connected = null;
 
 function setStatus(ok) {
   if (ok === connected) return;
   connected = ok;
-  chrome.action.setBadgeText({ text: ok ? 'ON' : 'OFF' });
-  chrome.action.setBadgeBackgroundColor({ color: ok ? '#1fbf75' : '#f0485a' });
-  chrome.action.setTitle({ title: ok ? 'Daytrade Assist: connected' : 'Daytrade Assist: app not running' });
+  api.action.setBadgeText({ text: ok ? 'ON' : 'OFF' });
+  api.action.setBadgeBackgroundColor({ color: ok ? '#1fbf75' : '#f0485a' });
+  api.action.setTitle({ title: ok ? 'Daytrade Assist: connected' : 'Daytrade Assist: app not running' });
 }
 
 const clean = (s) => String(s).replace(/[,\r\n]/g, ' ').trim();
@@ -38,7 +40,7 @@ function encode(msg) {
   return lines;
 }
 
-chrome.runtime.onMessage.addListener((msg, sender) => {
+api.runtime.onMessage.addListener((msg, sender) => {
   if (!msg || !Array.isArray(msg.rows) || !msg.rows.length) return;
   if (msg.kind === 'stream' && sender.tab) {
     for (const [asset] of msg.rows) tabs.set(asset, { tabId: sender.tab.id, frameId: sender.frameId ?? 0 });
@@ -57,7 +59,7 @@ function dispatch(line) {
   const target = tabs.get(asset);
   const fail = (why) => fetch(`${APP}/ingest`, { method: 'POST', body: `orders\nfailed,${requestId},${clean(why)}` }).catch(() => {});
   if (!target) return fail(`no open Pocket Option tab is streaming ${asset}`);
-  chrome.tabs.sendMessage(target.tabId, { type: 'order', order }, { frameId: target.frameId }).catch(() => fail('the Pocket Option tab did not respond; reload it'));
+  Promise.resolve(api.tabs.sendMessage(target.tabId, { type: 'order', order }, { frameId: target.frameId })).catch(() => fail('the Pocket Option tab did not respond; reload it'));
 }
 
 let polling = false;
@@ -69,6 +71,8 @@ async function pollOrders() {
       const r = await fetch(`${APP}/bridge/orders`, { cache: 'no-store' });
       setStatus(true);
       if (r.status === 200) (await r.text()).split('\n').forEach(dispatch);
+      // An older app without order support answers 404: don't spin on it.
+      else if (r.status !== 204) await new Promise((done) => setTimeout(done, 5000));
     } catch {
       setStatus(false);
       await new Promise((done) => setTimeout(done, 2000));

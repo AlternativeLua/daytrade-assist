@@ -1,5 +1,6 @@
 #[cfg(feature = "app")]
 mod app;
+mod bridge;
 mod candle;
 mod feed;
 mod indicators;
@@ -264,23 +265,6 @@ fn default_data_dir() -> PathBuf {
     }
 }
 
-const EXTENSION: [(&str, &str); 4] = [
-    ("manifest.json", include_str!("../extension/manifest.json")),
-    ("inject.js", include_str!("../extension/inject.js")),
-    ("relay.js", include_str!("../extension/relay.js")),
-    ("background.js", include_str!("../extension/background.js")),
-];
-
-/// Writes the browser bridge to a stable folder Chrome can load it from.
-fn write_extension(data_dir: &Path) -> io::Result<PathBuf> {
-    let dir = data_dir.join("pocket-option-bridge");
-    fs::create_dir_all(&dir)?;
-    for (name, body) in EXTENSION {
-        fs::write(dir.join(name), body)?;
-    }
-    Ok(dir)
-}
-
 /// Sends each saved tick log to the engine as a backfill, trimming logs that
 /// have grown well past what is kept in memory.
 fn load_tick_logs(dir: &Path, registry: &Registry, tx: &SyncSender<Input>) -> io::Result<()> {
@@ -356,11 +340,12 @@ fn run(cfg: &'static Config) -> io::Result<()> {
         registry.id(&name)
     };
 
-    let mut extension_dir = None;
+    let mut bridge = None;
     if let Some(dir) = &cfg.data_dir {
         fs::create_dir_all(dir.join("ticks"))?;
-        extension_dir = Some(write_extension(dir)?);
+        bridge = Some(bridge::write(dir)?);
     }
+    let path = |p: &Path| p.to_string_lossy().into_owned();
 
     let mut session = Session::new(cfg, registry.clone())?;
     let mut url = None;
@@ -374,7 +359,9 @@ fn run(cfg: &'static Config) -> io::Result<()> {
             UiConfig {
                 addr: addr.clone(),
                 journal: Some(journal.clone()),
-                extension_dir: extension_dir.as_ref().map(|d| d.to_string_lossy().into_owned()),
+                extension_dir: bridge.as_ref().map(|b| path(&b.chrome_dir)),
+                firefox_dir: bridge.as_ref().map(|b| path(&b.firefox_dir)),
+                firefox_xpi: bridge.as_ref().map(|b| path(&b.firefox_xpi)),
                 stake: cfg.stake,
                 payout: cfg.payout,
                 balance: cfg.balance,
@@ -395,8 +382,9 @@ fn run(cfg: &'static Config) -> io::Result<()> {
         session.ui = Some(ui);
         url = Some(format!("http://{addr}"));
         eprintln!("UI at http://{addr}  (journal: {journal})");
-        if let Some(dir) = &extension_dir {
-            eprintln!("Pocket Option bridge extension: {}", dir.display());
+        if let Some(b) = &bridge {
+            eprintln!("Pocket Option bridge extension: {} (Chromium)", b.chrome_dir.display());
+            eprintln!("                                {} (Firefox)", b.firefox_xpi.display());
         }
     }
 

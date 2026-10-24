@@ -152,7 +152,8 @@
   }
 
   window.addEventListener('message', (event) => {
-    if (event.source !== window || !event.data || event.data[TAG_IN] !== true) return;
+    // Only the tag is checked: Firefox doesn't report the content script as `window`.
+    if (!event.data || event.data[TAG_IN] !== true) return;
     const o = event.data.order;
     if (o && typeof o.asset === 'string' && Number.isFinite(o.amount) && o.amount > 0 && Number.isFinite(o.time)) placeOrder(o);
   });

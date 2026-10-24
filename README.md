@@ -19,15 +19,32 @@ open "dist/Daytrade Assist.app"    # or drag it into /Applications
 - **Timeframe:** 15s, 30s, 1m, 2m, 5m or 15m. This sets both the candle size and the trade expiry. Switching retrains from that pair's saved ticks in well under a second.
 - **History tab:** every live trade, across sessions. You can filter by pair, timeframe, feed and period.
 
-The app keeps its data in `~/Library/Application Support/Daytrade Assist` on macOS, or `%APPDATA%\Daytrade Assist` on Windows: `ticks/` (one log per pair, used for training on the next start), `journal.jsonl` (trade history) and `pocket-option-bridge/` (the browser extension).
+The app keeps its data in `~/Library/Application Support/Daytrade Assist` on macOS, or `%APPDATA%\Daytrade Assist` on Windows:
+- `ticks/`: one log per pair, used for training on the next start.
+- `journal.jsonl`: trade history.
+- `logs/`: decision logs.
+- The browser extension: `pocket-option-bridge/` for Chromium browsers, and `pocket-option-bridge-firefox/` plus `pocket-option-bridge-firefox.xpi` for Firefox-based browsers.
+
+Replacing the app with a newer version keeps all of it.
 
 ## Connect Pocket Option
 
-Pocket Option has no public API. Instead, a small Chrome extension reads the price stream that your logged-in Pocket Option tab already receives, and forwards it to the app on `127.0.0.1:8787`. It never sees your password. It only sends anything to Pocket Option if you turn on demo-account trading (see below).
+Pocket Option has no public API. Instead, a small browser extension reads the price stream that your logged-in Pocket Option tab already receives, and forwards it to the app on `127.0.0.1:8787`. It never sees your password. It only sends anything to Pocket Option if you turn on demo-account trading (see below).
 
-1. In Chrome, open `chrome://extensions` and turn on **Developer mode**.
-2. Click **Load unpacked** and choose the `pocket-option-bridge` folder. The app's **Connect Pocket Option** button has a **Show folder** shortcut.
-3. Open Pocket Option (the demo account is fine) and pick an OTC pair. The pair shows up in the app within a few seconds, together with the chart history Pocket Option loads, which the app trains on straight away.
+The app's **Connect Pocket Option** button walks you through these steps, with **Show folder** shortcuts.
+
+**Chrome, Edge, Brave, Opera:**
+1. Open `chrome://extensions` (or `edge://extensions`) and turn on **Developer mode**.
+2. Click **Load unpacked** and choose the `pocket-option-bridge` folder in the data folder.
+
+**Firefox, Zen, LibreWolf, Floorp, Waterfox** (Firefox 128 or newer):
+- *To keep it installed* (Zen, LibreWolf, Floorp, Waterfox, Firefox Developer Edition or Nightly):
+  1. In `about:config`, set `xpinstall.signatures.required` to `false`.
+  2. In `about:addons`, click ⚙ → **Install Add-on From File…** and choose `pocket-option-bridge-firefox.xpi`. Allow the permissions it asks for.
+- *Regular Firefox* only keeps Mozilla-signed add-ons. Load it for the session instead: `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** → `pocket-option-bridge-firefox/manifest.json`. It's removed when Firefox restarts.
+- If no prices arrive, go to `about:addons` → *Daytrade Assist bridge* → **Permissions** and turn everything on.
+
+**Then:** open Pocket Option (the demo account is fine) and pick an OTC pair. The pair shows up in the app within a few seconds, together with the chart history Pocket Option loads, which the app trains on straight away.
 
 Each pair you open in Pocket Option is added to the list. The extension's badge shows **ON** while prices are reaching the app.
 

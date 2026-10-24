@@ -113,6 +113,8 @@ fn bridge_ticks_reach_the_ui() {
 
     assert!(request(&addr, "GET", "/", None, "").contains("<title>Daytrade Assist</title>"));
     assert!(dir.join("pocket-option-bridge").join("manifest.json").exists());
+    assert!(dir.join("pocket-option-bridge-firefox").join("manifest.json").exists());
+    assert!(std::fs::read(dir.join("pocket-option-bridge-firefox.xpi")).unwrap().starts_with(b"PK\x03\x04"));
 
     // What the extension sends: chart history first, then live ticks.
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();

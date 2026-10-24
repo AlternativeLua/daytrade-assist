@@ -352,16 +352,35 @@
   <div class="dlg-head"><h2>Connect Pocket Option</h2><button class="x" id="dlgClose" aria-label="Close">×</button></div>
   <div class="dlg-body">
     <div class="status-line"><span class="dot" id="dlgDot"></span><span id="dlgStatus"></span></div>
-    <p style="margin-top:0">A small Chrome extension forwards the prices and payouts your logged-in Pocket Option tab already receives to this app. It never sees your password. It only places trades when you turn on <b>Place trades on demo account</b>, and only on a tab logged in to the demo account.</p>
-    <ol>
-      <li>In Chrome, open <code>chrome://extensions</code> and turn on <b>Developer mode</b> (top right). If you loaded an older version, click its reload button instead and skip step 2.</li>
-      <li>Click <b>Load unpacked</b> and choose this folder:
-        <div class="path"><span id="extPath" style="flex:1">—</span><button class="btn ghost" id="revealBtn">Show folder</button></div>
-      </li>
-      <li>Open Pocket Option (the demo account is fine), pick an OTC pair and leave the tab open. Reload the tab if it was already open.</li>
-      <li>The pair appears in the currency list here within a few seconds. Open more pairs in Pocket Option to add them.</li>
-    </ol>
-    <p class="fine">The extension's badge shows <b>ON</b> while prices reach the app. Keep this app running, since the extension sends to 127.0.0.1:8787. Pocket Option doesn't support third-party tools and may change its site at any time, which can stop the bridge working. This is for paper trading and research, not advice.</p>
+    <p style="margin-top:0">A small browser extension forwards the prices and payouts your logged-in Pocket Option tab already receives to this app. It never sees your password. It only places trades when you turn that on in the Paper account card, and only on the account you chose there.</p>
+    <div class="seg" id="browserSeg" style="margin-bottom:10px">
+      <button data-browser="chrome" class="on">Chrome · Edge · Brave · Opera</button>
+      <button data-browser="firefox">Firefox · Zen · LibreWolf · Floorp</button>
+    </div>
+    <div id="steps-chrome">
+      <ol>
+        <li>Open <code>chrome://extensions</code> (Edge: <code>edge://extensions</code>) and turn on <b>Developer mode</b>. If you loaded an older version, click its reload button instead and skip step 2.</li>
+        <li>Click <b>Load unpacked</b> and choose this folder:
+          <div class="path"><span id="extPath" style="flex:1">—</span><button class="btn ghost" data-reveal="chrome">Show folder</button></div>
+        </li>
+        <li>Open Pocket Option, pick an OTC pair and leave the tab open. Reload the tab if it was already open.</li>
+        <li>The pair appears in the currency list here within a few seconds. Open more pairs in Pocket Option to add them.</li>
+      </ol>
+    </div>
+    <div id="steps-firefox" style="display:none">
+      <p style="margin:0 0 4px"><b>Keep it installed</b> (Zen, LibreWolf, Floorp, Waterfox, Firefox Developer Edition or Nightly):</p>
+      <ol>
+        <li>Open <code>about:config</code>, search <code>xpinstall.signatures.required</code> and set it to <b>false</b>.</li>
+        <li>Open <code>about:addons</code>, click the gear ⚙ → <b>Install Add-on From File…</b> and choose:
+          <div class="path"><span id="xpiPath" style="flex:1">—</span><button class="btn ghost" data-reveal="firefox">Show folder</button></div>
+        </li>
+        <li>Allow the permissions it asks for: the Pocket Option sites, and this app on 127.0.0.1.</li>
+      </ol>
+      <p style="margin:8px 0 4px"><b>Regular Firefox</b> only keeps Mozilla-signed add-ons, so load it for this session instead. It is removed when Firefox restarts: open <code>about:debugging#/runtime/this-firefox</code>, click <b>Load Temporary Add-on…</b> and pick <code>manifest.json</code> in:</p>
+      <div class="path"><span id="ffPath" style="flex:1">—</span><button class="btn ghost" data-reveal="firefox">Show folder</button></div>
+      <p style="margin:8px 0 0">Then open Pocket Option and pick an OTC pair. If no prices arrive, open <code>about:addons</code> → <b>Daytrade Assist bridge</b> → <b>Permissions</b> and turn everything on.</p>
+    </div>
+    <p class="fine">The extension's badge shows <b>ON</b> while it can reach the app. Keep this app running, since the extension sends to 127.0.0.1:8787. Pocket Option doesn't support third-party tools and may change its site at any time, which can stop the bridge working. This is for paper trading and research, not advice.</p>
   </div>
 </dialog>
 
@@ -476,12 +495,23 @@ function renderBridge() {
   const st = bridgeState();
   $('bridgeDot').className = 'dot ' + st.cls; $('bridgeText').textContent = st.text;
   $('dlgDot').className = 'dot ' + st.cls; $('dlgStatus').textContent = st.detail;
-  $('extPath').textContent = S.cfg && S.cfg.extensionDir ? S.cfg.extensionDir : 'Run the app (not the CLI) to create the extension folder.';
-  $('revealBtn').style.display = S.cfg && S.cfg.extensionDir ? '' : 'none';
+  const none = 'Run the app (not the CLI) to create the extension.';
+  $('extPath').textContent = S.cfg && S.cfg.extensionDir || none;
+  $('xpiPath').textContent = S.cfg && S.cfg.firefoxXpi || none;
+  $('ffPath').textContent = S.cfg && S.cfg.firefoxDir || none;
+  document.querySelectorAll('[data-reveal]').forEach(b => { b.style.display = S.cfg && S.cfg.extensionDir ? '' : 'none'; });
 }
 $('bridgeBtn').addEventListener('click', () => { renderBridge(); $('connectDlg').showModal(); });
 $('dlgClose').addEventListener('click', () => $('connectDlg').close());
-$('revealBtn').addEventListener('click', () => fetch('/api/reveal-extension', { method: 'POST' }).catch(() => {}));
+document.querySelectorAll('[data-reveal]').forEach(b => b.addEventListener('click', () =>
+  fetch('/api/reveal-extension', { method: 'POST', body: new URLSearchParams({ browser: b.dataset.reveal }) }).catch(() => {})));
+function showBrowser(which) {
+  document.querySelectorAll('#browserSeg button').forEach(b => b.classList.toggle('on', b.dataset.browser === which));
+  $('steps-chrome').style.display = which === 'chrome' ? '' : 'none';
+  $('steps-firefox').style.display = which === 'firefox' ? '' : 'none';
+}
+$('browserSeg').addEventListener('click', e => { const b = e.target.closest('button'); if (b) showBrowser(b.dataset.browser); });
+showBrowser(/firefox|librewolf|zen|floorp|waterfox/i.test(navigator.userAgent) ? 'firefox' : 'chrome');
 
 // ---------- stream ----------
 function connect() {

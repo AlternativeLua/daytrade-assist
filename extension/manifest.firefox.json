@@ -1,0 +1,67 @@
+{
+  "manifest_version": 3,
+  "name": "Daytrade Assist — Pocket Option bridge",
+  "version": "0.4.0",
+  "description": "Forwards Pocket Option prices and payouts to Daytrade Assist on this computer, and places its signals as trades on your Pocket Option account when you turn that on in the app.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "pocket-option-bridge@daytrade-assist",
+      "strict_min_version": "128.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
+  },
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "https://pocketoption.com/*",
+    "https://*.pocketoption.com/*",
+    "https://po.trade/*",
+    "https://*.po.trade/*",
+    "https://po2.trade/*",
+    "https://*.po2.trade/*"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "action": {
+    "default_title": "Daytrade Assist bridge"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://pocketoption.com/*",
+        "https://*.pocketoption.com/*",
+        "https://po.trade/*",
+        "https://*.po.trade/*",
+        "https://po2.trade/*",
+        "https://*.po2.trade/*"
+      ],
+      "js": [
+        "inject.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://pocketoption.com/*",
+        "https://*.pocketoption.com/*",
+        "https://po.trade/*",
+        "https://*.po.trade/*",
+        "https://po2.trade/*",
+        "https://*.po2.trade/*"
+      ],
+      "js": [
+        "relay.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ]
+}

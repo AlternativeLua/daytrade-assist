@@ -34,6 +34,8 @@ pub struct UiConfig {
     pub addr: String,
     pub journal: Option<String>,
     pub extension_dir: Option<String>,
+    pub firefox_dir: Option<String>,
+    pub firefox_xpi: Option<String>,
     pub stake: f64,
     pub payout: f64,
     pub balance: f64,
@@ -265,6 +267,7 @@ struct Shared {
     hub: Sender<Msg>,
     orders: Arc<OrderQueue>,
     extension_dir: Option<String>,
+    firefox_dir: Option<String>,
     logs_dir: Option<std::path::PathBuf>,
 }
 
@@ -280,6 +283,7 @@ impl Ui {
             hub: tx.clone(),
             orders: orders.clone(),
             extension_dir: cfg.extension_dir.clone(),
+            firefox_dir: cfg.firefox_dir.clone(),
             logs_dir: logs_dir(&cfg.journal),
         });
         let hub = Hub::new(cfg)?;
@@ -464,7 +468,8 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
             respond(&mut stream, "200 OK", "text/plain", "ok")
         }
         ("POST", "/api/reveal-extension") if from_ui => {
-            if let Some(dir) = &shared.extension_dir {
+            let firefox = parse_form(&String::from_utf8_lossy(&req.body)).get("browser").is_some_and(|b| b == "firefox");
+            if let Some(dir) = if firefox { &shared.firefox_dir } else { &shared.extension_dir } {
                 reveal(dir);
             }
             respond(&mut stream, "200 OK", "text/plain", "ok")
@@ -1100,7 +1105,7 @@ impl Hub {
         let opt = |v: &Option<String>| v.as_deref().map_or("null".into(), |p| format!("\"{}\"", escape(p)));
         let _ = write!(
             s,
-            r#"{{"type":"snapshot","config":{{"stake":{},"payout":{},"balance":{},"z":{},"minSamples":{},"journal":{},"extensionDir":{},"session":{}}},"phase":"{}","asset":"{}","tf":{},"assets":{},"bridge":{},"backtest":{},"status":{},"market":{},"orders":{},"candles":["#,
+            r#"{{"type":"snapshot","config":{{"stake":{},"payout":{},"balance":{},"z":{},"minSamples":{},"journal":{},"extensionDir":{},"firefoxDir":{},"firefoxXpi":{},"session":{}}},"phase":"{}","asset":"{}","tf":{},"assets":{},"bridge":{},"backtest":{},"status":{},"market":{},"orders":{},"candles":["#,
             num(c.stake),
             num(c.payout),
             num(c.balance),
@@ -1108,6 +1113,8 @@ impl Hub {
             num(c.min_samples),
             opt(&c.journal),
             opt(&c.extension_dir),
+            opt(&c.firefox_dir),
+            opt(&c.firefox_xpi),
             self.session,
             phase_name(self.phase),
             escape(&self.asset),
