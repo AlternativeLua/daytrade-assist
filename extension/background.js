@@ -31,6 +31,9 @@ function encode(msg) {
   if (msg.kind === 'orders') {
     return ['orders', ...msg.rows.map((r) => r.map(clean).join(','))];
   }
+  if (msg.kind === 'balance') {
+    return ['balance', ...msg.rows.filter((r) => Number.isFinite(r[1])).map((r) => `${r[0] ? 1 : 0},${r[1]}`)];
+  }
   if (msg.kind === 'diag') {
     return ['diag', ...msg.rows.map((r) => String(r[0]).replace(/[\r\n]/g, ' '))];
   }

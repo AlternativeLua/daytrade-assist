@@ -15,8 +15,9 @@ use std::time::Duration;
 use crate::candle::Candle;
 use crate::feed::{AssetCache, Input, Registry, SettingsChange, Tick, TradeMode, now_ms, parse_line};
 use crate::latency::Histogram;
-use crate::paper::{Outcome, Settlement};
-use crate::strategy::{EXPERTS, Pick, Record, Side, Signal, expert_name};
+use crate::paper::{Outcome, Settlement, Trade};
+use crate::power::Awake;
+use crate::strategy::{EXPERTS, Pick, Record, RuleScore, Side, Signal, expert_name};
 
 const INDEX: &str = include_str!("../ui/index.html");
 const MAX_CANDLES: usize = 3000;
@@ -58,6 +59,17 @@ pub struct AssetInfo {
     pub first_ts: i64,
     pub last_ts: i64,
     pub last_price: f64,
+    /// When its last tick arrived, by this computer's clock; 0 if none this session.
+    pub seen_ms: i64,
+}
+
+/// How far one asset has trained on one timeframe.
+#[derive(Clone, Debug)]
+pub struct TrainingRow {
+    pub asset: String,
+    pub period_ms: i64,
+    pub candles: u64,
+    pub best: Option<RuleScore>,
 }
 
 pub enum Event {
@@ -96,6 +108,16 @@ pub enum Event {
         s: Settlement,
         rule: Option<Pick>,
         balance: f64,
+        asset: String,
+        period_ms: i64,
+    },
+    /// A paper trade opened by auto mode, on any pair; `None` when an open
+    /// trade was dropped because its pair stopped sending prices.
+    Opened(Option<(String, i64, Trade, Option<Pick>)>),
+    Training {
+        rows: Vec<TrainingRow>,
+        saved_at: Option<i64>,
+        file: Option<String>,
     },
     Status(Status),
     OrderSent(OrderSent),
@@ -144,15 +166,34 @@ pub struct Status {
     pub real_pnl: f64,
     pub stop_reason: Option<String>,
     pub stake: f64,
+    /// 0 when stakes are a fixed amount.
+    pub stake_pct: f64,
+    /// What the next run of trades starts at.
+    pub base_amount: f64,
     pub payout: Option<f64>,
     pub open: bool,
     pub can_trade: bool,
     pub min_payout: f64,
     pub next_stake: f64,
+    /// Whether the paper balance covers the next stake.
+    pub can_afford: bool,
     pub step: u32,
     pub steps: u32,
     pub mult: f64,
     pub z: f64,
+    pub awake: Awake,
+    /// Whether the system agreed to stay awake.
+    pub awake_ok: bool,
+    pub auto: bool,
+    /// Pairs auto mode can trade right now: streaming, open and paying enough.
+    pub auto_pairs: usize,
+    pub balance: f64,
+    pub start_balance: f64,
+    /// Whether the balance follows the Pocket Option account.
+    pub sync: bool,
+    /// Latest balances the bridge saw on Pocket Option.
+    pub po_demo: Option<f64>,
+    pub po_real: Option<f64>,
 }
 
 /// A real order on the Pocket Option demo account, from sending to settling.
@@ -407,6 +448,17 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
                 let n = ingest_assets(&body, shared);
                 return respond(&mut stream, "200 OK", "text/plain", &n.to_string());
             }
+            if body.starts_with("balance") {
+                for line in body.lines().skip(1) {
+                    let Some((demo, balance)) = line.split_once(',') else { continue };
+                    if let Ok(balance) = balance.trim().parse::<f64>() {
+                        if balance.is_finite() && balance >= 0.0 {
+                            let _ = shared.input.send(Input::Balance { demo: demo.trim() == "1", balance });
+                        }
+                    }
+                }
+                return respond(&mut stream, "200 OK", "text/plain", "ok");
+            }
             if body.starts_with("diag") {
                 let reports = body.lines().skip(1).map(|l| l.chars().take(4000).collect()).collect();
                 let _ = shared.hub.send(Msg::Diag(reports));
@@ -453,6 +505,7 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
                 martingale_mult: num("mult").filter(|m| (1.0..=5.0).contains(m)),
                 z: num("z").filter(|z| (0.0..=4.0).contains(z)),
                 stake: num("stake").filter(|s| *s >= 1.0 && *s <= 1_000_000.0),
+                stake_pct: num("stakePct").filter(|p| (0.0..=100.0).contains(p)),
                 mode: match form.get("mode").map(String::as_str) {
                     Some("off") => Some(TradeMode::Off),
                     Some("demo") => Some(TradeMode::Demo),
@@ -463,6 +516,10 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
                 },
                 paused: form.get("paused").map(|v| v == "1"),
                 loss_limit: num("lossLimit").filter(|l| *l > 0.0),
+                awake: form.get("awake").and_then(|v| Awake::parse(v)),
+                auto: form.get("auto").map(|v| v == "1"),
+                balance: num("balance").filter(|b| *b >= 1.0 && *b <= 100_000_000.0),
+                sync: form.get("sync").map(|v| v == "1"),
             };
             let _ = shared.input.send(Input::Settings(change));
             respond(&mut stream, "200 OK", "text/plain", "ok")
@@ -601,6 +658,8 @@ struct Hub {
     journal_file: Option<File>,
     rules: String,
     status: String,
+    auto: bool,
+    training: String,
     market: String,
     po_orders: VecDeque<PoOrder>,
     po_saved: VecDeque<String>,
@@ -671,6 +730,8 @@ impl Hub {
             journal_file,
             rules: "[]".into(),
             status: "null".into(),
+            auto: false,
+            training: "null".into(),
             market: "[]".into(),
             po_orders: VecDeque::new(),
             po_saved,
@@ -793,7 +854,8 @@ impl Hub {
                     self.preview = "null".into();
                     self.backtest = "null".into();
                 }
-                if phase != Phase::Ended {
+                // Auto mode's account carries on across pairs; switching the chart doesn't reset it.
+                if phase != Phase::Ended && !self.auto {
                     self.trades.clear();
                     self.open = "null".into();
                     self.balance = self.cfg.balance;
@@ -815,12 +877,13 @@ impl Hub {
                     }
                     let _ = write!(
                         s,
-                        r#"{{"name":"{}","ticks":{},"first":{},"last":{},"price":{}}}"#,
+                        r#"{{"name":"{}","ticks":{},"first":{},"last":{},"price":{},"seen":{}}}"#,
                         escape(&a.name),
                         a.ticks,
                         a.first_ts,
                         a.last_ts,
-                        num(a.last_price)
+                        num(a.last_price),
+                        a.seen_ms
                     );
                 }
                 s.push(']');
@@ -892,7 +955,8 @@ impl Hub {
                 self.preview = "null".into();
                 if let (Some((price, slot)), Some(side), Some(pick)) = (entry, sig.side, sig.best) {
                     self.open = format!(
-                        r#"{{"time":{},"side":"{}","entry":{},"rule":"{}","rate":{}}}"#,
+                        r#"{{"asset":"{}","time":{},"side":"{}","entry":{},"rule":"{}","rate":{}}}"#,
+                        escape(&self.asset),
                         slot * self.period_ms,
                         side_name(side),
                         num(price),
@@ -931,26 +995,95 @@ impl Hub {
                 });
                 Some(format!(r#"{{"type":"orders","orders":{}}}"#, self.orders_json()))
             }
+            Event::Opened(trade) => {
+                self.open = trade.as_ref().map_or("null".into(), |(asset, period_ms, t, pick)| {
+                    format!(
+                        r#"{{"asset":"{}","tf":{},"time":{},"side":"{}","entry":{},"stake":{},"rule":{},"rate":{}}}"#,
+                        escape(asset),
+                        period_ms / 1000,
+                        t.expiry_slot * period_ms,
+                        side_name(t.side),
+                        num(t.entry),
+                        num(t.stake),
+                        pick.map_or("null".into(), |p| format!("\"{}\"", rule_name(p.expert))),
+                        pick.map_or("null".into(), |p| num(p.rate)),
+                    )
+                });
+                if let Some(log) = &mut self.log {
+                    let kind = if trade.is_some() { "open" } else { "dropped" };
+                    log.write(now_ms(), &format!(r#"{{"type":"{kind}","t":{},"trade":{}}}"#, now_ms(), self.open));
+                }
+                Some(format!(r#"{{"type":"open","open":{}}}"#, self.open))
+            }
+            Event::Training { rows, saved_at, file } => {
+                let mut s = String::new();
+                let _ = write!(
+                    s,
+                    r#"{{"savedAt":{},"file":{},"rows":["#,
+                    saved_at.map_or("null".into(), |t| t.to_string()),
+                    file.map_or("null".into(), |f| format!("\"{}\"", escape(&f))),
+                );
+                join(
+                    &mut s,
+                    rows.iter().map(|r| {
+                        let best = r.best.map_or("null".into(), |b| {
+                            format!(
+                                r#"{{"rule":"{}","rate":{},"lower":{},"n":{}}}"#,
+                                rule_name(b.expert),
+                                num(b.rate),
+                                num(b.lower),
+                                num(b.n)
+                            )
+                        });
+                        format!(
+                            r#"{{"asset":"{}","tf":{},"candles":{},"best":{best}}}"#,
+                            escape(&r.asset),
+                            r.period_ms / 1000,
+                            r.candles
+                        )
+                    }),
+                );
+                s.push_str("]}");
+                if s == self.training {
+                    return None;
+                }
+                self.training = s;
+                Some(format!(r#"{{"type":"training","training":{}}}"#, self.training))
+            }
             Event::Status(st) => {
                 let previous = std::mem::take(&mut self.status);
+                self.auto = st.auto;
                 self.status = format!(
-                    r#"{{"mode":"{}","paused":{},"lossLimit":{},"realPnl":{},"stopReason":{},"stake":{},"payout":{},"open":{},"canTrade":{},"minPayout":{},"nextStake":{},"step":{},"steps":{},"mult":{},"z":{}}}"#,
+                    r#"{{"mode":"{}","paused":{},"lossLimit":{},"realPnl":{},"stopReason":{},"stake":{},"stakePct":{},"baseAmount":{},"payout":{},"open":{},"canTrade":{},"minPayout":{},"nextStake":{},"canAfford":{},"step":{},"steps":{},"mult":{},"z":{},"awake":"{}","awakeOk":{},"auto":{},"autoPairs":{},"balance":{},"startBalance":{},"sync":{},"poDemo":{},"poReal":{}}}"#,
                     st.mode.name(),
                     st.paused,
                     num(st.loss_limit),
                     num(st.real_pnl),
                     st.stop_reason.as_deref().map_or("null".into(), |r| format!("\"{}\"", escape(r))),
                     num(st.stake),
+                    num(st.stake_pct),
+                    num(st.base_amount),
                     st.payout.map_or("null".into(), num),
                     st.open,
                     st.can_trade,
                     num(st.min_payout),
                     num(st.next_stake),
+                    st.can_afford,
                     st.step,
                     st.steps,
                     num(st.mult),
                     num(st.z),
+                    st.awake.name(),
+                    st.awake_ok,
+                    st.auto,
+                    st.auto_pairs,
+                    num(st.balance),
+                    num(st.start_balance),
+                    st.sync,
+                    st.po_demo.map_or("null".into(), num),
+                    st.po_real.map_or("null".into(), num),
                 );
+                self.balance = st.balance;
                 if self.status != previous {
                     if let Some(log) = &mut self.log {
                         log.write(now_ms(), &format!(r#"{{"type":"status","t":{},"status":{}}}"#, now_ms(), self.status));
@@ -962,10 +1095,16 @@ impl Hub {
                 self.preview = format!(r#"{{"slot":{slot},"signal":{}}}"#, self.signal_json(&sig, slot));
                 Some(format!(r#"{{"type":"preview","preview":{}}}"#, self.preview))
             }
-            Event::Settled { s, rule, balance } => {
+            Event::Settled {
+                s,
+                rule,
+                balance,
+                asset,
+                period_ms,
+            } => {
                 self.balance = balance;
                 self.open = "null".into();
-                let trade = self.trade_json(&s, rule);
+                let trade = self.trade_json(&s, rule, &asset, period_ms);
                 self.trades.push(trade.clone());
                 if let Some(log) = &mut self.log {
                     log.write(now_ms(), &format!(r#"{{"type":"settle","trade":{trade}}}"#));
@@ -1010,7 +1149,7 @@ impl Hub {
         )
     }
 
-    fn trade_json(&self, s: &Settlement, rule: Option<Pick>) -> String {
+    fn trade_json(&self, s: &Settlement, rule: Option<Pick>, asset: &str, period_ms: i64) -> String {
         let outcome = match s.outcome {
             Outcome::Win => "WIN",
             Outcome::Loss => "LOSS",
@@ -1019,10 +1158,10 @@ impl Hub {
         format!(
             r#"{{"session":{},"asset":"{}","tf":{},"source":"{}","time":{},"side":"{}","entry":{},"exit":{},"outcome":"{outcome}","pnl":{},"stake":{},"step":{},"payout":{},"rule":{},"rate":{}}}"#,
             self.session,
-            escape(&self.asset),
-            self.period_ms / 1000,
-            if self.asset.starts_with("DEMO:") { "demo" } else { "feed" },
-            s.trade.expiry_slot * self.period_ms,
+            escape(asset),
+            period_ms / 1000,
+            if asset.starts_with("DEMO:") { "demo" } else { "feed" },
+            s.trade.expiry_slot * period_ms,
             side_name(s.trade.side),
             num(s.trade.entry),
             num(s.exit),
@@ -1166,11 +1305,12 @@ impl Hub {
         join(&mut s, self.journal.iter().cloned());
         let _ = write!(
             s,
-            r#"],"signal":{},"open":{},"preview":{},"rules":{},"stats":{}}}"#,
+            r#"],"signal":{},"open":{},"preview":{},"rules":{},"training":{},"stats":{}}}"#,
             self.signal,
             self.open,
             self.preview,
             self.rules,
+            self.training,
             self.stats_json()
         );
         s

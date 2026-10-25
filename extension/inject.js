@@ -4,8 +4,9 @@
 // Pocket Option uses socket.io. Prices arrive as a binary attachment to an
 // `updateStream` event, shaped [["EURUSD_otc", <unix seconds>, <price>], ...],
 // chart history as {asset, period, history: [[<unix seconds>, <price>], ...]},
-// and the asset table (`updateAssets`) as rows of
-// [id, symbol, name, kind, digits, payout%, ..., isOpen (index 14), ...].
+// the asset table (`updateAssets`) as rows of
+// [id, symbol, name, kind, digits, payout%, ..., isOpen (index 14), ...],
+// and the account balance as {isDemo, balance} (`successupdateBalance`).
 //
 // When Daytrade Assist sends an order, it is placed with the same socket.io
 // `openOrder` message the site's own Buy buttons use, and only on a socket
@@ -68,6 +69,10 @@
     if (socket.__daDiag && socket.__daDiag.events.length < 40 && !socket.__daDiag.events.includes(name)) socket.__daDiag.events.push(name);
     if (name === 'successopenOrder' || name === 'successcloseOrder' || name === 'updateClosedDeals') {
       onDeals(name, data);
+    } else if (/balance/i.test(name) && data && typeof data === 'object' && Number.isFinite(Number(data.balance))) {
+      // Which account: the message says, or else the account this socket logged in to.
+      const demo = 'isDemo' in data ? Number(data.isDemo) === 1 : socket.__daDemo;
+      if (demo !== undefined) emit('balance', [[demo ? 1 : 0, Number(data.balance)]]);
     } else if (name === 'failopenOrder') {
       const req = data && data.requestId != null ? String(data.requestId) : [...placed.keys()].pop();
       if (req && placed.has(req)) {

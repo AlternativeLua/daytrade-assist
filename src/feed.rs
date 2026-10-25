@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::io::BufRead;
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::power::Awake;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tick {
@@ -27,6 +29,10 @@ pub enum Input {
     /// Current payout (0.92 = 92%) and whether each asset is open for trading.
     Payouts(Vec<(AssetId, f64, bool)>),
     Settings(SettingsChange),
+    /// The Pocket Option account balance the bridge saw, for the demo or the real account.
+    Balance { demo: bool, balance: f64 },
+    /// Save training and flush logs, then reply; sent before the app quits.
+    Flush(Sender<()>),
     /// A finite source (file, stdin, instant sim) has finished.
     SourceDone,
 }
@@ -38,10 +44,19 @@ pub struct SettingsChange {
     pub martingale_mult: Option<f64>,
     pub z: Option<f64>,
     pub stake: Option<f64>,
+    /// Stake as a % of the balance; 0 goes back to the fixed `stake`.
+    pub stake_pct: Option<f64>,
     pub mode: Option<TradeMode>,
     pub paused: Option<bool>,
     /// Real-money losses (in account currency) after which real trading switches itself off.
     pub loss_limit: Option<f64>,
+    pub awake: Option<Awake>,
+    /// Trade any streaming pair with a qualified signal, not just the selected one.
+    pub auto: Option<bool>,
+    /// Restart the paper account at this balance.
+    pub balance: Option<f64>,
+    /// Follow the Pocket Option account's balance instead of a paper one.
+    pub sync: Option<bool>,
 }
 
 /// Where signals go besides the paper account.

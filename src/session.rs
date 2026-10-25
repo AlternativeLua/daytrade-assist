@@ -1,22 +1,31 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Stdout, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
 use crate::Config;
-use crate::candle::{Aggregator, Candle, MIN_PERIOD_MS};
+use crate::candle::{Candle, MIN_PERIOD_MS};
 use crate::feed::{AssetId, Input, Registry, Tick, TradeMode};
 use crate::latency::{Histogram, Ns};
-use crate::paper::{Martingale, Outcome, Paper, Settlement};
+use crate::paper::{Martingale, Outcome, Paper, Settlement, Trade};
+use crate::power::{Awake, KeepAwake};
 use crate::strategy::{EXPERTS, Engine, Params, Pick, Side, Signal, expert_name};
 use crate::feed::now_ms;
-use crate::ui::{AssetInfo, Event, OrderSent, Phase, Status, Ui};
+use crate::training::{self, Learner, Store, TIMEFRAMES_MS};
+use crate::ui::{AssetInfo, Event, OrderSent, Phase, Status, TrainingRow, Ui};
 
 /// About a week of ticks at Pocket Option's ~1 tick per second.
 pub const MAX_TICKS: usize = 600_000;
 const MAX_REPLAY_CANDLES: usize = 3_000;
+const TRAINING_PUSH_SECS: u64 = 5;
+const TRAINING_SAVE_SECS: u64 = 60;
+/// The selected pair counts as stopped after this long without prices.
+const STOPPED_MS: i64 = 30_000;
+/// Pairs that sent prices this recently count as streaming.
+const STREAMING_MS: i64 = 10_000;
 
 pub fn is_demo(name: &str) -> bool {
     name.starts_with("DEMO:")
@@ -28,6 +37,11 @@ struct Series {
     /// Opened on first use, so assets that never tick get no file.
     log: Option<BufWriter<File>>,
     log_checked: bool,
+    /// When the last tick arrived, by this computer's clock. Feed timestamps
+    /// can't be used for this: Pocket Option's run hours off the local clock.
+    seen_ms: i64,
+    /// One per timeframe in `Session::periods`, learning whether or not this asset is selected.
+    learners: Vec<Learner>,
 }
 
 impl Series {
@@ -48,8 +62,9 @@ impl Series {
     }
 }
 
-/// The engine thread: buffers every asset's ticks, and runs the candle →
-/// rules → paper-trade pipeline for the one selected asset and timeframe.
+/// The engine thread: buffers every asset's ticks, trains every asset on every
+/// timeframe, and runs the candle → rules → paper-trade pipeline for the one
+/// selected asset and timeframe.
 pub struct Session {
     cfg: &'static Config,
     p: Printer,
@@ -58,8 +73,9 @@ pub struct Session {
     series: Vec<Series>,
     active: Option<AssetId>,
     switched_to_real: bool,
-    agg: Aggregator,
-    engine: Engine,
+    /// The selected asset and timeframe. It duplicates that asset's background
+    /// learner, plus the paper account and UI updates.
+    learner: Learner,
     paper: Paper,
     close_lat: Histogram,
     tick_lat: Histogram,
@@ -80,6 +96,7 @@ pub struct Session {
     martingale: Martingale,
     z: f64,
     stake: f64,
+    stake_pct: f64,
     /// Whether live paper trades are also placed on Pocket Option, and on which account.
     mode: TradeMode,
     /// No new trades of any kind while paused; learning and signals continue.
@@ -90,6 +107,26 @@ pub struct Session {
     open_mirror: TradeMode,
     stop_reason: Option<String>,
     order_seq: u64,
+    /// Timeframes every asset learns.
+    periods: Vec<i64>,
+    /// Training saved in earlier sessions, updated each time it is saved again.
+    store: Store,
+    training_path: Option<PathBuf>,
+    saved_at: Option<i64>,
+    last_save: Instant,
+    last_training_push: Instant,
+    awake: Awake,
+    awake_guard: Option<KeepAwake>,
+    /// Trade any streaming pair on the selected timeframe, not just the selected pair.
+    auto: bool,
+    /// Asset and timeframe of the open paper trade.
+    trade_on: Option<(AssetId, i64)>,
+    /// Starting balance for a fresh paper account.
+    balance: f64,
+    /// Follow the Pocket Option balance of the account trades go to.
+    sync: bool,
+    /// Latest Pocket Option balances: real, demo.
+    po_balance: [Option<f64>; 2],
 }
 
 impl Session {
@@ -98,7 +135,8 @@ impl Session {
             steps: cfg.martingale_steps,
             mult: cfg.martingale_mult,
         };
-        let paper = Paper::new(cfg.balance, cfg.stake, cfg.payout, martingale);
+        let mut paper = Paper::new(cfg.balance, cfg.stake, cfg.payout, martingale);
+        paper.stake_pct = cfg.stake_pct;
         let record = match &cfg.record {
             Some(path) => Some(BufWriter::new(
                 OpenOptions::new()
@@ -109,6 +147,12 @@ impl Session {
             )),
             None => None,
         };
+        let training_path = cfg.data_dir.as_ref().map(|d| d.join("training.txt"));
+        let store = training_path.as_deref().map(training::load).unwrap_or_default();
+        let mut periods = TIMEFRAMES_MS.to_vec();
+        if !periods.contains(&cfg.period_ms.max(MIN_PERIOD_MS)) {
+            periods.push(cfg.period_ms.max(MIN_PERIOD_MS));
+        }
         Ok(Self {
             cfg,
             p: Printer {
@@ -120,8 +164,7 @@ impl Session {
             series: Vec::new(),
             active: None,
             switched_to_real: false,
-            agg: Aggregator::new(cfg.period_ms),
-            engine: Engine::new(cfg.params, paper.breakeven()),
+            learner: Learner::new(cfg.period_ms, cfg.params, paper.breakeven(), None),
             paper,
             close_lat: Histogram::default(),
             tick_lat: Histogram::default(),
@@ -141,6 +184,7 @@ impl Session {
             martingale,
             z: cfg.params.z,
             stake: cfg.stake,
+            stake_pct: cfg.stake_pct,
             mode: TradeMode::Off,
             paused: false,
             loss_limit: cfg.loss_limit,
@@ -148,6 +192,19 @@ impl Session {
             open_mirror: TradeMode::Off,
             stop_reason: None,
             order_seq: 0,
+            periods,
+            store,
+            training_path,
+            saved_at: None,
+            last_save: Instant::now(),
+            last_training_push: Instant::now(),
+            awake: Awake::Off,
+            awake_guard: None,
+            auto: cfg.auto,
+            trade_on: None,
+            balance: cfg.balance,
+            sync: false,
+            po_balance: [None, None],
         })
     }
 
@@ -156,6 +213,8 @@ impl Session {
         if !self.quiet {
             self.p.header(&mut self.out)?;
         }
+        // On this thread: on Windows only the thread that asked can let the computer sleep again.
+        self.set_awake(self.cfg.awake);
         let mut done = 0;
         while let Ok(input) = rx.recv() {
             match input {
@@ -178,11 +237,19 @@ impl Session {
                     self.paper.set_martingale(self.martingale);
                     if let Some(z) = change.z {
                         self.z = z;
-                        self.engine.set_z(z);
+                        self.learner.engine.set_z(z);
+                        for l in self.series.iter_mut().flat_map(|s| &mut s.learners) {
+                            l.engine.set_z(z);
+                        }
+                        self.push_training();
                     }
                     if let Some(stake) = change.stake {
                         self.stake = stake;
                         self.paper.base_stake = stake;
+                    }
+                    if let Some(pct) = change.stake_pct {
+                        self.stake_pct = pct;
+                        self.paper.stake_pct = pct;
                     }
                     if let Some(limit) = change.loss_limit {
                         self.loss_limit = limit;
@@ -191,13 +258,42 @@ impl Session {
                         if mode == TradeMode::Real && self.mode != TradeMode::Real {
                             self.real_pnl = 0.0;
                         }
+                        let account_changed = (mode == TradeMode::Real) != (self.mode == TradeMode::Real);
                         self.mode = mode;
                         self.stop_reason = None;
+                        if account_changed {
+                            self.apply_sync(true);
+                        }
+                    }
+                    if let Some(balance) = change.balance {
+                        self.balance = balance;
+                        self.sync = false;
+                        self.paper.set_balance(balance, true);
+                    }
+                    if let Some(sync) = change.sync {
+                        self.sync = sync;
+                        self.apply_sync(true);
                     }
                     if let Some(paused) = change.paused {
                         self.paused = paused;
                     }
+                    if let Some(awake) = change.awake {
+                        self.set_awake(awake);
+                    }
+                    if let Some(auto) = change.auto {
+                        self.auto = auto;
+                    }
                     self.push_status();
+                }
+                Input::Balance { demo, balance } => {
+                    self.po_balance[demo as usize] = Some(balance);
+                    self.apply_sync(false);
+                    self.push_status();
+                }
+                Input::Flush(done) => {
+                    self.save_training();
+                    self.flush_logs()?;
+                    let _ = done.send(());
                 }
                 Input::SourceDone => {
                     done += 1;
@@ -208,6 +304,7 @@ impl Session {
             }
         }
         self.summary("summary")?;
+        self.save_training();
         self.flush_logs()?;
         self.out.flush()?;
         self.phase(Phase::Ended);
@@ -220,14 +317,119 @@ impl Session {
         }
         while self.series.len() <= id as usize {
             let name = self.registry.name(self.series.len() as AssetId);
+            let learners = self.periods.iter().map(|&p| self.new_learner(&name, p)).collect();
             self.series.push(Series {
                 name,
                 ticks: VecDeque::new(),
                 log: None,
                 log_checked: false,
+                seen_ms: 0,
+                learners,
             });
         }
         self.push_assets();
+    }
+
+    fn params(&self) -> Params {
+        Params { z: self.z, ..self.cfg.params }
+    }
+
+    /// A learner starting from whatever was saved for this asset and timeframe.
+    fn new_learner(&self, name: &str, period_ms: i64) -> Learner {
+        let saved = self.store.get(&(name.to_owned(), period_ms)).copied();
+        Learner::new(period_ms, self.params(), self.breakeven_for(name), saved)
+    }
+
+    fn breakeven_for(&self, name: &str) -> f64 {
+        let payout = self.registry.find(name).and_then(|id| self.payouts.get(&id)).map_or(self.cfg.payout, |p| p.0);
+        1.0 / (1.0 + payout)
+    }
+
+    /// Adds a timeframe that every asset learns from now on, starting from its buffered ticks.
+    fn ensure_period(&mut self, period_ms: i64) {
+        if self.periods.contains(&period_ms) {
+            return;
+        }
+        self.periods.push(period_ms);
+        for i in 0..self.series.len() {
+            let mut l = self.new_learner(&self.series[i].name, period_ms);
+            for &t in &self.series[i].ticks {
+                l.push(t);
+            }
+            self.series[i].learners.push(l);
+        }
+    }
+
+    /// Relearns every timeframe of an asset from its buffered ticks, after older
+    /// ticks arrived. Each keeps its earlier training where that knows more.
+    fn rebuild_learners(&mut self, id: AssetId) {
+        let (params, breakeven) = (self.params(), self.breakeven_for(&self.series[id as usize].name));
+        let s = &mut self.series[id as usize];
+        for l in &mut s.learners {
+            let mut fresh = Learner::new(l.agg.period_ms(), params, breakeven, l.snapshot());
+            for &t in &s.ticks {
+                fresh.push(t);
+            }
+            *l = fresh;
+        }
+    }
+
+    /// Writes every asset's training to the data folder. Demo pairs are
+    /// simulated afresh each start, so theirs isn't kept.
+    fn save_training(&mut self) {
+        self.last_save = Instant::now();
+        let Some(path) = self.training_path.clone() else { return };
+        for s in self.series.iter().filter(|s| !is_demo(&s.name)) {
+            for l in &s.learners {
+                if let Some(snap) = l.snapshot() {
+                    self.store.insert((s.name.clone(), l.agg.period_ms()), snap);
+                }
+            }
+        }
+        if self.store.is_empty() {
+            return;
+        }
+        match training::save(&path, &self.store) {
+            Ok(()) => self.saved_at = Some(now_ms()),
+            Err(e) => eprintln!("couldn't save training to {}: {e}", path.display()),
+        }
+        self.push_training();
+    }
+
+    fn push_training(&mut self) {
+        self.last_training_push = Instant::now();
+        let Some(ui) = &self.ui else { return };
+        let rows = self
+            .series
+            .iter()
+            .filter(|s| !s.ticks.is_empty())
+            .flat_map(|s| {
+                s.learners.iter().map(|l| TrainingRow {
+                    asset: s.name.clone(),
+                    period_ms: l.agg.period_ms(),
+                    candles: l.candles(),
+                    best: l.strongest(),
+                })
+            })
+            .collect();
+        ui.send(Event::Training {
+            rows,
+            saved_at: self.saved_at,
+            file: self.training_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        });
+    }
+
+    fn set_awake(&mut self, awake: Awake) {
+        if awake == self.awake && (awake == Awake::Off || self.awake_guard.is_some()) {
+            return;
+        }
+        // Release first: on Windows the new state replaces the old one anyway.
+        self.awake_guard = None;
+        self.awake_guard = KeepAwake::start(awake);
+        self.awake = awake;
+        if awake != Awake::Off && self.awake_guard.is_none() {
+            eprintln!("couldn't keep this computer awake: the system refused");
+        }
     }
 
     #[inline]
@@ -247,16 +449,164 @@ impl Session {
             s.ticks.pop_front();
         }
         s.ticks.push_back(t);
+        s.seen_ms = now_ms();
+        let mut closes = Vec::new();
+        for l in &mut s.learners {
+            if let Some((closed, sig)) = l.push(t) {
+                closes.push((l.agg.period_ms(), closed, sig));
+            }
+        }
         s.append_log(self.cfg, &[t])?;
         if let Some(r) = &mut self.record {
             writeln!(r, "{},{},{}", s.name, t.ts_ms, t.price)?;
         }
-        if s.ticks.len() == 1 || self.last_housekeeping.elapsed().as_millis() >= 1000 {
+        let first = s.ticks.len() == 1;
+        for (period_ms, closed, sig) in closes {
+            self.background_close(id, t, period_ms, &closed, &sig)?;
+        }
+        if first || self.last_housekeeping.elapsed().as_millis() >= 1000 {
             self.last_housekeeping = Instant::now();
+            self.drop_stale_trade();
+            self.follow_streaming()?;
             self.flush_logs()?;
             self.push_assets();
+            if self.last_save.elapsed().as_secs() >= TRAINING_SAVE_SECS {
+                self.save_training();
+            } else if self.last_training_push.elapsed().as_secs() >= TRAINING_PUSH_SECS {
+                self.push_training();
+            }
         }
         Ok(())
+    }
+
+    /// A background learner's candle closed. Settles the open trade if it is on
+    /// this asset and timeframe and the selected pipeline isn't the one running
+    /// it; in auto mode, opens a trade here if nothing is open.
+    fn background_close(&mut self, id: AssetId, t: Tick, period_ms: i64, closed: &Candle, sig: &Signal) -> io::Result<()> {
+        let selected = self.active == Some(id) && period_ms == self.learner.agg.period_ms();
+        if self.trade_on == Some((id, period_ms)) && (self.auto || !selected) {
+            let rule = self.open_pick;
+            if let Some(s) = self.settle(closed) {
+                self.open_pick = None;
+                if let Some(ui) = &self.ui {
+                    ui.send(Event::Settled {
+                        s,
+                        rule,
+                        balance: self.paper.balance,
+                        asset: self.series[id as usize].name.clone(),
+                        period_ms,
+                    });
+                }
+                if !self.quiet {
+                    self.p.settlement(&mut self.out, &s, &self.paper)?;
+                }
+                self.push_status();
+            }
+        }
+
+        if !self.auto || self.paused || self.paper.open.is_some() || period_ms != self.learner.agg.period_ms() {
+            return Ok(());
+        }
+        let Some(side) = sig.side else { return Ok(()) };
+        // Only pairs of the same kind as the one on screen: live feeds, or simulated demo pairs.
+        let demo = is_demo(&self.series[id as usize].name);
+        let same_kind = self.active.is_some_and(|a| is_demo(&self.series[a as usize].name) == demo);
+        let Some((payout, _)) = self.payout_of(id).filter(|_| same_kind && self.tradeable(id)) else {
+            return Ok(());
+        };
+        self.paper.payout = payout;
+        let opened = self.paper.open(side, t.price, t.ts_ms.div_euclid(period_ms));
+        self.paper.payout = self.payout_or_default();
+        let Some(trade) = self.paper.open.filter(|_| opened) else { return Ok(()) };
+        self.trade_on = Some((id, period_ms));
+        self.open_pick = sig.best;
+        self.place_order(id, trade, period_ms, t.ts_ms);
+        if let Some(ui) = &self.ui {
+            ui.send(Event::Opened(Some((self.series[id as usize].name.clone(), period_ms, trade, sig.best))));
+        }
+        self.push_status();
+        Ok(())
+    }
+
+    /// Settles the open trade on `closed`, and counts it toward the real-money loss limit.
+    fn settle(&mut self, closed: &Candle) -> Option<Settlement> {
+        let s = self.paper.settle(closed)?;
+        self.trade_on = None;
+        if std::mem::replace(&mut self.open_mirror, TradeMode::Off) == TradeMode::Real {
+            self.count_real(s.pnl);
+        }
+        Some(s)
+    }
+
+    fn count_real(&mut self, pnl: f64) {
+        self.real_pnl += pnl;
+        if self.mode == TradeMode::Real && self.real_pnl <= -self.loss_limit {
+            self.mode = TradeMode::Off;
+            self.stop_reason = Some(format!(
+                "real trading stopped: lost {:.2}, the loss limit is {:.2}",
+                -self.real_pnl, self.loss_limit
+            ));
+        }
+    }
+
+    /// Drops the open trade once its pair has sent no prices for two candles,
+    /// so one stalled pair can't block auto mode all night. A real-money order
+    /// behind it counts as lost toward the loss limit.
+    fn drop_stale_trade(&mut self) {
+        let (Some((id, period_ms)), Some(trade)) = (self.trade_on, self.paper.open) else { return };
+        if now_ms() - self.series[id as usize].seen_ms < 2 * period_ms + 10_000 {
+            return;
+        }
+        self.paper.void();
+        self.trade_on = None;
+        self.open_pick = None;
+        if std::mem::replace(&mut self.open_mirror, TradeMode::Off) == TradeMode::Real {
+            self.count_real(-trade.stake);
+        }
+        if let Some(ui) = &self.ui {
+            ui.send(Event::Opened(None));
+        }
+        self.push_status();
+    }
+
+    /// Pocket Option only streams the pairs open there. When the selected pair
+    /// stops while others keep streaming (its chart was closed or swapped), the
+    /// app moves to the streaming pair with the best payout instead of freezing.
+    fn follow_streaming(&mut self) -> io::Result<()> {
+        let Some(active) = self.active else { return Ok(()) };
+        let now = now_ms();
+        let s = &self.series[active as usize];
+        if self.cfg.asset.is_some() || is_demo(&s.name) || now - s.seen_ms < STOPPED_MS {
+            return Ok(());
+        }
+        let payout = |id: AssetId| self.payout_of(id).map_or(0.0, |(p, open)| if open { p } else { 0.0 });
+        let next = (0..self.series.len() as AssetId)
+            .filter(|&i| !is_demo(&self.series[i as usize].name) && now - self.series[i as usize].seen_ms < STREAMING_MS)
+            .max_by(|&a, &b| payout(a).total_cmp(&payout(b)));
+        match next {
+            Some(id) => self.select(id, self.learner.agg.period_ms()),
+            None => Ok(()),
+        }
+    }
+
+    /// Mirrors a paper trade to Pocket Option when that's switched on.
+    fn place_order(&mut self, id: AssetId, trade: Trade, period_ms: i64, time_ms: i64) {
+        let asset = &self.series[id as usize].name;
+        let Some(ui) = &self.ui else { return };
+        if self.mode == TradeMode::Off || is_demo(asset) {
+            return;
+        }
+        self.order_seq += 1;
+        self.open_mirror = self.mode;
+        ui.place_order(OrderSent {
+            account: self.mode,
+            request_id: (now_ms() * 100 + (self.order_seq % 100) as i64).to_string(),
+            asset: asset.clone(),
+            call: trade.side == Side::Call,
+            amount: (trade.stake * 100.0).round() / 100.0,
+            expiry_secs: period_ms / 1000,
+            time_ms,
+        });
     }
 
     /// Picks the first asset that ticks (or `--asset`), and moves off a demo
@@ -268,11 +618,11 @@ impl Session {
         match self.active {
             None if wanted => {
                 self.switched_to_real |= !demo;
-                self.select(id, self.agg.period_ms())
+                self.select(id, self.learner.agg.period_ms())
             }
             Some(cur) if cur != id && !self.switched_to_real && is_demo(&self.series[cur as usize].name) && !demo => {
                 self.switched_to_real = true;
-                self.select(id, self.agg.period_ms())
+                self.select(id, self.learner.agg.period_ms())
             }
             _ => Ok(()),
         }
@@ -298,23 +648,43 @@ impl Session {
         while s.ticks.len() > MAX_TICKS {
             s.ticks.pop_front();
         }
+        self.rebuild_learners(id);
         self.push_assets();
         if self.active == Some(id) {
-            self.select(id, self.agg.period_ms())?;
+            self.select(id, self.learner.agg.period_ms())?;
+        }
+        // Chart history from the bridge is a burst of new learning, worth keeping straight away.
+        if save {
+            self.save_training();
+        } else {
+            self.push_training();
         }
         Ok(())
     }
 
-    /// Switches asset and/or timeframe: a fresh engine learns from the asset's
-    /// buffered ticks (without trading), then a fresh paper account goes live.
+    /// Switches asset and/or timeframe: the asset's buffered ticks are replayed
+    /// (without trading) for the chart and to warm up the indicators, the
+    /// training it has built up so far is merged in, then a fresh paper account goes live.
     fn select(&mut self, id: AssetId, period_ms: i64) -> io::Result<()> {
         self.ensure_series(id);
         let period_ms = period_ms.max(MIN_PERIOD_MS);
+        self.ensure_period(period_ms);
         self.active = Some(id);
-        self.agg = Aggregator::new(period_ms);
         self.p.period_ms = period_ms;
-        let params = Params { z: self.z, ..self.cfg.params };
-        self.engine = Engine::new(params, 1.0 / (1.0 + self.payout_or_default()));
+        let trained = self.series[id as usize]
+            .learners
+            .iter()
+            .find(|l| l.agg.period_ms() == period_ms)
+            .and_then(Learner::snapshot);
+        let breakeven = 1.0 / (1.0 + self.payout_or_default());
+        self.learner = Learner::new(period_ms, self.params(), breakeven, trained);
+        // Auto mode's account and open trade carry on; the replay gets an account of its own.
+        let kept = if self.auto {
+            let fresh = self.new_paper();
+            Some((std::mem::replace(&mut self.paper, fresh), self.trade_on.take(), self.open_pick.take(), self.open_mirror))
+        } else {
+            None
+        };
         self.reset_account();
         self.previewed_slot = i64::MIN;
         self.learning = true;
@@ -354,7 +724,7 @@ impl Session {
             ui.send(Event::Replayed {
                 total_candles: self.replay_candles.len(),
                 candles: self.replay_candles[start..].to_vec(),
-                records: *self.engine.records(),
+                records: *self.learner.engine.records(),
                 wins: self.paper.wins,
                 losses: self.paper.losses,
                 ties: self.paper.ties,
@@ -363,21 +733,36 @@ impl Session {
         }
         self.replay_candles = Vec::new();
         self.reset_account();
+        if let Some((paper, trade_on, pick, mirror)) = kept {
+            self.paper = paper;
+            self.trade_on = trade_on;
+            self.open_pick = pick;
+            self.open_mirror = mirror;
+        }
         self.phase(Phase::Live);
         self.push_assets();
         self.apply_payout();
+        self.push_training();
         Ok(())
     }
 
     /// The active asset's payout and open flag, if they are known. Assets from
     /// sources without payout data (demo pairs, files, the CLI) use `--payout`.
     fn active_payout(&self) -> Option<(f64, bool)> {
-        let id = self.active?;
+        self.payout_of(self.active?)
+    }
+
+    fn payout_of(&self, id: AssetId) -> Option<(f64, bool)> {
         if let Some(&p) = self.payouts.get(&id) {
             return Some(p);
         }
-        let demo = is_demo(&self.series[id as usize].name);
+        let demo = self.series.get(id as usize).is_some_and(|s| is_demo(&s.name));
         (!self.cfg.require_payout || demo).then_some((self.cfg.payout, true))
+    }
+
+    /// Open, and paying at least `--min-payout`.
+    fn tradeable(&self, id: AssetId) -> bool {
+        self.payout_of(id).is_some_and(|(p, open)| open && p + 1e-9 >= self.cfg.min_payout)
     }
 
     fn payout_or_default(&self) -> f64 {
@@ -389,10 +774,15 @@ impl Session {
     fn apply_payout(&mut self) {
         let payout = self.payout_or_default();
         self.paper.payout = payout;
-        self.engine.set_breakeven(1.0 / (1.0 + payout));
-        self.can_trade = self
-            .active_payout()
-            .is_some_and(|(p, open)| open && p + 1e-9 >= self.cfg.min_payout);
+        self.learner.engine.set_breakeven(1.0 / (1.0 + payout));
+        self.can_trade = self.active.is_some_and(|id| self.tradeable(id));
+        // Background learners decide auto mode's trades, so each needs its own pair's break-even.
+        let breakevens: Vec<f64> = self.series.iter().map(|s| self.breakeven_for(&s.name)).collect();
+        for (s, be) in self.series.iter_mut().zip(breakevens) {
+            for l in &mut s.learners {
+                l.engine.set_breakeven(be);
+            }
+        }
         self.push_status();
     }
 
@@ -406,17 +796,43 @@ impl Session {
                 real_pnl: self.real_pnl,
                 stop_reason: self.stop_reason.clone(),
                 stake: self.stake,
+                stake_pct: self.stake_pct,
+                base_amount: self.paper.base_amount(),
                 payout: known.map(|(p, _)| p),
                 open: known.is_some_and(|(_, open)| open),
                 can_trade: self.can_trade,
                 min_payout: self.cfg.min_payout,
                 next_stake: self.paper.next_stake(),
+                can_afford: self.paper.can_afford(),
                 step: self.paper.step,
                 steps: self.martingale.steps,
                 mult: self.martingale.mult,
                 z: self.z,
+                awake: self.awake,
+                awake_ok: self.awake == Awake::Off || self.awake_guard.is_some(),
+                auto: self.auto,
+                auto_pairs: self.auto_pairs(),
+                balance: self.paper.balance,
+                start_balance: self.paper.start_balance,
+                sync: self.sync,
+                po_demo: self.po_balance[1],
+                po_real: self.po_balance[0],
             }));
         }
+    }
+
+    /// Pairs auto mode could trade now: the same kind as the selected one,
+    /// streaming, open and paying enough.
+    fn auto_pairs(&self) -> usize {
+        let Some(active) = self.active else { return 0 };
+        let demo = is_demo(&self.series[active as usize].name);
+        let now = now_ms();
+        (0..self.series.len() as AssetId)
+            .filter(|&i| {
+                let s = &self.series[i as usize];
+                is_demo(&s.name) == demo && now - s.seen_ms < STREAMING_MS && self.tradeable(i)
+            })
+            .count()
     }
 
     fn phase(&self, phase: Phase) {
@@ -436,6 +852,7 @@ impl Session {
                     first_ts: s.ticks.front().map_or(0, |t| t.ts_ms),
                     last_ts: s.ticks.back().map_or(0, |t| t.ts_ms),
                     last_price: s.ticks.back().map_or(0.0, |t| t.price),
+                    seen_ms: s.seen_ms,
                 })
                 .collect();
             ui.send(Event::Assets(assets));
@@ -454,13 +871,37 @@ impl Session {
         Ok(())
     }
 
+    fn new_paper(&self) -> Paper {
+        let balance = self.synced_balance().unwrap_or(self.balance);
+        let mut paper = Paper::new(balance, self.stake, self.payout_or_default(), self.martingale);
+        paper.stake_pct = self.stake_pct;
+        paper
+    }
+
+    /// The Pocket Option balance to follow: real money's when trades go there,
+    /// otherwise the demo account's.
+    fn synced_balance(&self) -> Option<f64> {
+        let demo = self.mode != TradeMode::Real;
+        self.po_balance[demo as usize].filter(|_| self.sync)
+    }
+
+    /// Copies the Pocket Option balance into the account when syncing.
+    /// `restart` makes it the new starting point for P&L.
+    fn apply_sync(&mut self, restart: bool) {
+        if let Some(balance) = self.synced_balance() {
+            self.paper.set_balance(balance, restart);
+        }
+    }
+
     /// Keeps what the engine has learned, starts a fresh account and stats.
     fn reset_account(&mut self) {
-        self.paper = Paper::new(self.cfg.balance, self.stake, self.payout_or_default(), self.martingale);
+        self.paper = self.new_paper();
         self.close_lat = Histogram::default();
         self.tick_lat = Histogram::default();
         self.signals = 0;
         self.open_pick = None;
+        self.trade_on = None;
+        self.open_mirror = TradeMode::Off;
     }
 
     /// Tick → candle → rules → decision, with no allocation, locking or I/O
@@ -469,25 +910,20 @@ impl Session {
     fn on_tick(&mut self, tick: Tick) -> io::Result<()> {
         let t0 = Instant::now();
 
-        if let Some(closed) = self.agg.push(tick) {
-            let settled = self.paper.settle(&closed);
-            let sig = self.engine.on_close(&closed);
-            let new_slot = self.agg.slot(tick.ts_ms);
+        if let Some((closed, sig)) = self.learner.push(tick) {
+            let period_ms = self.learner.agg.period_ms();
+            // Live in auto mode, `background_close` runs the trades on every pair, this one included.
+            let auto = self.live && self.auto;
+            let mine = self.active.is_some_and(|id| self.trade_on == Some((id, period_ms)));
+            let settled = if !auto && mine { self.settle(&closed) } else { None };
+            let settled_rule = settled.and_then(|_| self.open_pick.take());
+            let new_slot = self.learner.agg.slot(tick.ts_ms);
             // Payout gating and pausing only apply live; history replays show what the rules would do.
             let allowed = !self.live || (self.can_trade && !self.paused);
-            if let Some(s) = &settled {
-                if std::mem::replace(&mut self.open_mirror, TradeMode::Off) == TradeMode::Real {
-                    self.real_pnl += s.pnl;
-                    if self.mode == TradeMode::Real && self.real_pnl <= -self.loss_limit {
-                        self.mode = TradeMode::Off;
-                        self.stop_reason = Some(format!(
-                            "real trading stopped: lost {:.2}, the loss limit is {:.2}",
-                            -self.real_pnl, self.loss_limit
-                        ));
-                    }
-                }
+            let opened = !auto && allowed && sig.side.is_some_and(|side| self.paper.open(side, tick.price, new_slot));
+            if opened {
+                self.trade_on = self.active.map(|id| (id, period_ms));
             }
-            let opened = allowed && sig.side.is_some_and(|side| self.paper.open(side, tick.price, new_slot));
             let dt = t0.elapsed();
             self.close_lat.record(dt);
             self.tick_lat.record(dt);
@@ -500,49 +936,40 @@ impl Session {
                 }
                 return Ok(());
             }
+            if opened {
+                self.open_pick = sig.best;
+                if let (Some(trade), Some(id)) = (self.paper.open, self.active) {
+                    self.place_order(id, trade, period_ms, tick.ts_ms);
+                }
+            }
             if let Some(ui) = &self.ui {
-                if let Some(s) = settled {
+                if let (Some(s), Some(id)) = (settled, self.active) {
                     ui.send(Event::Settled {
                         s,
-                        rule: self.open_pick.take(),
+                        rule: settled_rule,
                         balance: self.paper.balance,
+                        asset: self.series[id as usize].name.clone(),
+                        period_ms,
                     });
                 }
                 if settled.is_some() || opened {
                     self.push_status();
-                }
-                if opened {
-                    self.open_pick = sig.best;
-                    if let (Some(trade), Some(id)) = (self.paper.open, self.active) {
-                        let asset = &self.series[id as usize].name;
-                        if self.mode != TradeMode::Off && !is_demo(asset) {
-                            self.order_seq += 1;
-                            self.open_mirror = self.mode;
-                            ui.place_order(OrderSent {
-                                account: self.mode,
-                                request_id: (now_ms() * 100 + (self.order_seq % 100) as i64).to_string(),
-                                asset: asset.clone(),
-                                call: trade.side == Side::Call,
-                                amount: (trade.stake * 100.0).round() / 100.0,
-                                expiry_secs: self.agg.period_ms() / 1000,
-                                time_ms: tick.ts_ms,
-                            });
-                        }
-                    }
                 }
                 ui.send(Event::Closed {
                     candle: closed,
                     sig,
                     entry: opened.then_some((tick.price, new_slot)),
                     ns: dt.as_nanos() as u64,
-                    records: *self.engine.records(),
+                    records: *self.learner.engine.records(),
                 });
             }
             if !self.quiet {
                 if let Some(s) = settled {
                     self.p.settlement(&mut self.out, &s, &self.paper)?;
                 }
-                let skipped = if !allowed && self.paused {
+                let skipped = if auto {
+                    "auto mode trades from all pairs"
+                } else if !allowed && self.paused {
                     "paused"
                 } else if allowed {
                     "insufficient balance"
@@ -556,11 +983,11 @@ impl Session {
         }
 
         let show = self.live && (!self.quiet || self.ui.is_some());
-        if self.cfg.heads_up && !self.learning && show && self.agg.is_late(tick.ts_ms) {
-            if let Some(forming) = self.agg.current().copied() {
+        if self.cfg.heads_up && !self.learning && show && self.learner.agg.is_late(tick.ts_ms) {
+            if let Some(forming) = self.learner.agg.current().copied() {
                 if forming.slot != self.previewed_slot {
                     self.previewed_slot = forming.slot;
-                    let sig = self.engine.peek(&forming);
+                    let sig = self.learner.engine.peek(&forming);
                     if sig.side.is_some() {
                         if let Some(ui) = &self.ui {
                             ui.send(Event::Preview { slot: forming.slot, sig });
@@ -575,7 +1002,7 @@ impl Session {
         }
         self.tick_lat.record(t0.elapsed());
         if self.live {
-            if let (Some(ui), Some(forming)) = (&self.ui, self.agg.current()) {
+            if let (Some(ui), Some(forming)) = (&self.ui, self.learner.agg.current()) {
                 if self.last_forming_push.is_none_or(|t| t0.duration_since(t).as_millis() >= 100) {
                     self.last_forming_push = Some(t0);
                     ui.send(Event::Forming {
@@ -590,7 +1017,7 @@ impl Session {
 
     pub fn summary(&mut self, title: &str) -> io::Result<()> {
         self.p.summary(&mut self.out, title, &self.paper, self.signals, &self.close_lat, &self.tick_lat)?;
-        self.p.leaderboard(&mut self.out, &self.engine)
+        self.p.leaderboard(&mut self.out, &self.learner.engine)
     }
 }
 
@@ -765,10 +1192,14 @@ impl Printer {
             } else {
                 "fixed".to_owned()
             };
+            let base = if paper.stake_pct > 0.0 {
+                format!("{}% of balance", paper.stake_pct)
+            } else {
+                format!("{:.2}", paper.base_stake)
+            };
             writeln!(
                 out,
-                "stakes    base {:.2}, {sizing}   largest {:.2}   total staked {:.2}   return {:+.1}% of staked",
-                paper.base_stake,
+                "stakes    base {base}, {sizing}   largest {:.2}   total staked {:.2}   return {:+.1}% of staked",
                 paper.max_stake,
                 paper.staked,
                 pnl / paper.staked * 100.0,

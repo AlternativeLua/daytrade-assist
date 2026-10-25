@@ -16,6 +16,7 @@ pub struct Candle {
 }
 
 /// Builds fixed-period candles from a tick stream.
+#[derive(Clone, Copy)]
 pub struct Aggregator {
     period_ms: i64,
     late_ms: i64,

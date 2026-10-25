@@ -21,6 +21,7 @@ open "dist/Daytrade Assist.app"    # or drag it into /Applications
 
 The app keeps its data in `~/Library/Application Support/Daytrade Assist` on macOS, or `%APPDATA%\Daytrade Assist` on Windows:
 - `ticks/`: one log per pair, used for training on the next start.
+- `training.txt`: what every pair has learned on every timeframe, carried over between sessions.
 - `journal.jsonl`: trade history.
 - `logs/`: decision logs.
 - The browser extension: `pocket-option-bridge/` for Chromium browsers, and `pocket-option-bridge-firefox/` plus `pocket-option-bridge-firefox.xpi` for Firefox-based browsers.
@@ -49,6 +50,30 @@ The app's **Connect Pocket Option** button walks you through these steps, with *
 Each pair you open in Pocket Option is added to the list. The extension's badge shows **ON** while prices are reaching the app.
 
 The extension reads socket.io `updateStream` frames (`[["EURUSD_otc", <unix seconds>, <price>], …]`) and `history` arrays. These formats come from open-source Pocket Option clients and may change without notice. Pocket Option doesn't support third-party tools, so check its terms before using one.
+
+## Training on several pairs
+
+Every pair that sends prices learns all six timeframes at once, whether or not it's the pair on screen. Pocket Option only streams the pairs you have open, so open several (one per tab, or Pocket Option's multi-chart layout) to train them side by side.
+
+The **Training** tab shows each pair and timeframe: candles learned, and the best rule's lower confidence bound. Green cells beat that pair's break-even and are tradeable. Click a cell to select it.
+
+What has been learned is saved to `training.txt` every minute, after chart history arrives, and when the app closes. On the next start it is merged with the saved tick logs, so learning carries on from where it stopped, even for history older than the week of ticks the logs keep. Demo pairs are simulated afresh each start, so their training isn't saved.
+
+## Auto mode
+
+**Pairs traded → Auto: any streaming pair** (or `--auto`) trades whichever pair has a qualified signal on the selected timeframe, not just the pair on screen. It trades pairs of the same kind as the selected one: Pocket Option pairs, or demo pairs.
+
+- One trade at a time, taken from the first pair whose candle closes with a signal. So the multiplier after a loss, Pause and the real-money loss limit work as before.
+- Each pair is held to its own payout: it must pay at least the minimum payout, and its rule must beat that payout's break-even.
+- Orders go to Pocket Option as usual, through the tab streaming that pair.
+- Switching the chart doesn't reset the auto account or close its trade.
+- If the open trade's pair stops sending prices, the trade is dropped after three candles. A real-money order behind it counts as lost toward the loss limit.
+
+## Running overnight
+
+**Sleep → Stay awake, screen stays on** (or `--keep-awake`) stops the computer sleeping while the app is open. On macOS it holds the same power assertions as `caffeinate` (`pmset -g assertions` lists them), which also stops App Nap from slowing the app down. *Stay awake, screen can turn off* saves power, but the browser streaming Pocket Option may then be throttled, so the screen-on option is the safer choice overnight. An **AWAKE** pill shows while it's on.
+
+On a laptop, keep the lid open and the charger plugged in, because closing the lid still sleeps it. Keep the Pocket Option tab open and logged in. Real-money trading still turns itself off on restart and at the loss limit, so check it before leaving it unattended.
 
 ## Placing trades on Pocket Option
 
@@ -80,7 +105,11 @@ Each live candle is appended to `logs/decisions-YYYY-MM-DD.jsonl` in the data fo
 
 **Payout filter.** The bridge also reads Pocket Option's asset table, so the app knows each pair's live payout and whether it's open. Only pairs paying **85% or more** are traded (`--min-payout`). Below that, signals still show but no trade is placed. The **Payouts** tab lists every OTC currency pair by current payout. Pocket Option only streams prices for pairs you open, so open a high-payout pair there to trade it. Each trade is priced at the payout it opened with.
 
-**Amount and multiplier after a loss** (`--stake`, `--martingale` default 4, `--martingale-mult` default 2.1). After a loss the next amount is multiplied by 2.1, up to 4 losses in a row (10 → 21 → 44.10 → 92.61 → 194.48). A win, or a fifth loss in a row, goes back to the base amount. You can change all three in the app's account card, or set *After a loss* to keep the same amount.
+**Balance** (*Balance* in the account card). Either a paper balance you type in (`--balance`, default 1000), or **Sync with Pocket Option**: the account then follows the balance Pocket Option reports. That's the demo account's balance when trades go to demo or nowhere, and the real account's in real-money mode. % stakes and the check that a stake is affordable then use your actual balance. The bridge (0.6.0 or newer) reads the balance when the Pocket Option tab loads and after each trade, so reload the tab if it shows *Waiting for your balance*.
+
+**Stake as a % of the balance** (`--stake-pct`, *Stake → % of balance* in the app). Each run of trades starts at that % of the paper balance, at least 1. A multiplied stake after a loss scales the run's first stake, not the lower balance. With *Sync with Pocket Option* it's a % of your Pocket Option balance; otherwise of the paper balance.
+
+**Amount and multiplier after a loss** (`--stake`, `--martingale` default 4, `--martingale-mult` default 2.1). After a loss the next amount is multiplied by 2.1, up to 4 losses in a row (10 → 21 → 44.10 → 92.61 → 194.48). A win, a fifth loss in a row, or a multiplied amount the paper balance can't cover goes back to the base amount. You can change all three in the app's account card, or set *After a loss* to keep the same amount.
 
 At an 85% payout, 2.1× recovers the earlier losses if the win comes within 3 losses. Five losses in a row cost 36.2× the base amount.
 

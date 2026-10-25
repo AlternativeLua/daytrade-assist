@@ -73,6 +73,11 @@ pub struct Record {
 }
 
 impl Record {
+    /// Rebuilds a record from saved training.
+    pub fn from_parts(w: f64, n: f64, wins: u32, total: u32) -> Self {
+        Self { w, n, wins, total }
+    }
+
     #[inline]
     fn record(&mut self, win: bool, decay: f64) {
         self.w = self.w * decay + win as u8 as f64;
@@ -106,6 +111,15 @@ pub struct Pick {
     pub expert: usize,
     pub side: Side,
     /// Recency-weighted win rate.
+    pub rate: f64,
+    pub lower: f64,
+    pub n: f64,
+}
+
+/// A rule's standing, independent of what it votes on the next candle.
+#[derive(Clone, Copy, Debug)]
+pub struct RuleScore {
+    pub expert: usize,
     pub rate: f64,
     pub lower: f64,
     pub n: f64,
@@ -236,6 +250,8 @@ pub struct Engine {
     ind: Indicators,
     records: [Record; EXPERTS],
     pending: [i8; EXPERTS],
+    /// Candles learned from, including ones learned in earlier sessions.
+    candles: u64,
 }
 
 impl Engine {
@@ -247,6 +263,7 @@ impl Engine {
             ind: Indicators::new(),
             records: [Record::default(); EXPERTS],
             pending: [0; EXPERTS],
+            candles: 0,
         }
     }
 
@@ -263,6 +280,32 @@ impl Engine {
         &self.records
     }
 
+    pub fn candles(&self) -> u64 {
+        self.candles
+    }
+
+    /// Replaces what has been learned with saved training. Indicators and the
+    /// votes waiting for the next candle are kept.
+    pub fn restore(&mut self, records: [Record; EXPERTS], candles: u64) {
+        self.records = records;
+        self.candles = candles;
+    }
+
+    /// The rule with the highest lower bound among those with enough votes.
+    pub fn strongest(&self) -> Option<RuleScore> {
+        self.records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.n >= self.p.min_samples)
+            .map(|(expert, r)| RuleScore {
+                expert,
+                rate: r.w / r.n,
+                lower: wilson_lower(r.w, r.n, self.p.z),
+                n: r.n,
+            })
+            .max_by(|a, b| a.lower.total_cmp(&b.lower))
+    }
+
     /// What `on_close` would say if `forming` closed now, without committing it.
     #[inline]
     pub fn peek(&self, forming: &Candle) -> Signal {
@@ -273,6 +316,7 @@ impl Engine {
     /// Scores the previous votes against `c`, then votes on the candle after it.
     #[inline]
     pub fn on_close(&mut self, c: &Candle) -> Signal {
+        self.candles += 1;
         let color = sign(c.close - c.open);
         if color != 0 {
             for (rec, &vote) in self.records.iter_mut().zip(&self.pending) {

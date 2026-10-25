@@ -6,8 +6,10 @@ mod feed;
 mod indicators;
 mod latency;
 mod paper;
+mod power;
 mod session;
 mod strategy;
+mod training;
 mod ui;
 
 use std::fs::{self, File};
@@ -20,6 +22,7 @@ use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 
 use feed::{Input, Registry, SimParams, read_backfill, spawn_lines, spawn_sim};
+use power::Awake;
 use session::{MAX_TICKS, Session, log_file_name};
 use strategy::Params;
 use ui::{Ui, UiConfig};
@@ -50,6 +53,7 @@ OPTIONS:
     --history <FILE>    Learn from logged ticks first, then run the source
     --record <FILE>     Append every incoming tick to FILE (use it as --history next time)
     --stake <N>         Base paper stake per trade       [default: 10]
+    --stake-pct <F>     Stake this % of the balance instead (a run of losses multiplies its first stake)
     --payout <F>        Payout on a win when the feed doesn't report one, 0.85 or 85 [default: 0.85]
     --min-payout <F>    Don't trade pairs paying less than this [default: 0.85]
     --martingale <N>    After a loss, multiply the stake, up to N losses in a row,
@@ -64,6 +68,8 @@ OPTIONS:
     --ui-addr <ADDR>    Address for the UI and bridge    [default: 127.0.0.1:8787]
     --journal <FILE>    Trade journal for the UI's History tab [default: in the data folder]
     --data-dir <DIR>    Where the app keeps tick logs, the journal and the bridge extension
+    --auto              Trade any streaming pair with a qualified signal, one trade at a time
+    --keep-awake        Keep the computer and its screen awake (e.g. to run overnight)
     --no-demo           (app) Don't add the simulated DEMO pairs
     --demo              (pocket) Add the simulated DEMO pairs
     --browser           (app) Use the web browser instead of an app window
@@ -101,6 +107,7 @@ pub struct Config {
     journal: Option<String>,
     pub params: Params,
     pub stake: f64,
+    pub stake_pct: f64,
     pub payout: f64,
     pub balance: f64,
     pub digits: usize,
@@ -116,6 +123,8 @@ pub struct Config {
     pub loss_limit: f64,
     /// Live feeds must report a payout before their pairs are traded.
     pub require_payout: bool,
+    pub awake: Awake,
+    pub auto: bool,
     demo: bool,
     window: bool,
     sim: SimParams,
@@ -161,6 +170,7 @@ fn parse_args() -> Result<Config, String> {
         journal: None,
         params: Params::default(),
         stake: 10.0,
+        stake_pct: 0.0,
         payout: 0.85,
         balance: 1000.0,
         digits: 5,
@@ -174,6 +184,8 @@ fn parse_args() -> Result<Config, String> {
         min_payout: 0.85,
         loss_limit: 100.0,
         require_payout: bridged,
+        awake: Awake::Off,
+        auto: false,
         demo: source_is_app,
         window: true,
         sim: SimParams {
@@ -209,6 +221,7 @@ fn parse_args() -> Result<Config, String> {
             "--journal" => cfg.journal = Some(value(&flag)?),
             "--data-dir" => cfg.data_dir = Some(PathBuf::from(value(&flag)?)),
             "--stake" => num!(cfg.stake),
+            "--stake-pct" => num!(cfg.stake_pct),
             "--payout" => {
                 num!(cfg.payout);
                 cfg.payout = as_fraction(cfg.payout);
@@ -240,6 +253,8 @@ fn parse_args() -> Result<Config, String> {
             "--no-demo" => cfg.demo = false,
             "--demo" => cfg.demo = true,
             "--browser" => cfg.window = false,
+            "--auto" => cfg.auto = true,
+            "--keep-awake" => cfg.awake = Awake::Display,
             "-h" | "--help" => return Err(String::new()),
             _ => return Err(format!("unknown option `{flag}`")),
         }
@@ -375,7 +390,7 @@ fn run(cfg: &'static Config) -> io::Result<()> {
             Ok(ui) => ui,
             Err(e) if e.kind() == io::ErrorKind::AddrInUse && cfg.source == Source::App => {
                 // Most likely the app is already running: show that one.
-                return show(cfg, format!("http://{addr}"));
+                return show(cfg, format!("http://{addr}"), || {});
             }
             Err(e) => return Err(io::Error::new(e.kind(), format!("UI on {addr}: {e}"))),
         };
@@ -446,6 +461,7 @@ fn run(cfg: &'static Config) -> io::Result<()> {
             finite = 1;
         }
     }
+    let flush_tx = tx.clone();
     drop(tx);
 
     if cfg.source == Source::App {
@@ -454,7 +470,14 @@ fn run(cfg: &'static Config) -> io::Result<()> {
                 eprintln!("engine stopped: {e}");
             }
         })?;
-        return show(cfg, url.unwrap_or_default());
+        // Closing the window ends the process, so training is saved first.
+        let before_exit = move || {
+            let (done_tx, done_rx) = mpsc::channel();
+            if flush_tx.send(Input::Flush(done_tx)).is_ok() {
+                let _ = done_rx.recv_timeout(std::time::Duration::from_secs(3));
+            }
+        };
+        return show(cfg, url.unwrap_or_default(), before_exit);
     }
 
     session.run(rx, finite)?;
@@ -468,11 +491,13 @@ fn run(cfg: &'static Config) -> io::Result<()> {
 }
 
 /// Shows the UI in the app window, or the browser when built without one.
-fn show(cfg: &Config, url: String) -> io::Result<()> {
+fn show(cfg: &Config, url: String, before_exit: impl FnOnce() + 'static) -> io::Result<()> {
     #[cfg(feature = "app")]
     if cfg.window {
-        app::run_window(&url);
+        app::run_window(&url, before_exit);
     }
+    #[cfg(not(feature = "app"))]
+    drop(before_exit);
     let _ = cfg;
     let mut opener = if cfg!(target_os = "macos") {
         std::process::Command::new("open")

@@ -6,8 +6,9 @@ use tao::event_loop::{ControlFlow, EventLoop};
 use tao::window::WindowBuilder;
 use wry::WebViewBuilder;
 
-/// Runs the window on the main thread until it is closed, then exits.
-pub fn run_window(url: &str) -> ! {
+/// Runs the window on the main thread until it is closed, then calls
+/// `before_exit` and exits.
+pub fn run_window(url: &str, before_exit: impl FnOnce() + 'static) -> ! {
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title("Daytrade Assist")
@@ -20,15 +21,22 @@ pub fn run_window(url: &str) -> ! {
         .build(&window)
         .expect("failed to create the web view");
 
+    let mut before_exit = Some(before_exit);
     event_loop.run(move |event, _, control_flow| {
         let _keep_alive = &webview;
         *control_flow = ControlFlow::Wait;
-        if let Event::WindowEvent {
-            event: WindowEvent::CloseRequested,
-            ..
-        } = event
-        {
-            *control_flow = ControlFlow::Exit;
+        match event {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => *control_flow = ControlFlow::Exit,
+            // Also reached by Cmd+Q, which skips CloseRequested.
+            Event::LoopDestroyed => {
+                if let Some(f) = before_exit.take() {
+                    f();
+                }
+            }
+            _ => {}
         }
     })
 }

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Daytrade Assist — Pocket Option bridge",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Forwards Pocket Option prices and payouts to Daytrade Assist on this computer, and places its signals as trades on your Pocket Option account when you turn that on in the app.",
   "browser_specific_settings": {
     "gecko": {
