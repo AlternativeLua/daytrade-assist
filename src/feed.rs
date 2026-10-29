@@ -38,11 +38,13 @@ pub enum Input {
 }
 
 /// Settings changed from the UI; `None` leaves a setting as it is.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SettingsChange {
     pub martingale_steps: Option<u32>,
     pub martingale_mult: Option<f64>,
     pub z: Option<f64>,
+    /// A trade frequency level, which sets `z` and the track record check together.
+    pub frequency: Option<crate::strategy::Frequency>,
     pub stake: Option<f64>,
     /// Stake as a % of the balance; 0 goes back to the fixed `stake`.
     pub stake_pct: Option<f64>,
@@ -57,6 +59,8 @@ pub struct SettingsChange {
     pub balance: Option<f64>,
     /// Follow the Pocket Option account's balance instead of a paper one.
     pub sync: Option<bool>,
+    /// Pairs auto mode may trade; empty means every pair.
+    pub auto_list: Option<Vec<String>>,
 }
 
 /// Where signals go besides the paper account.

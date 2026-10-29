@@ -157,6 +157,12 @@ fn bridge_ticks_reach_the_ui() {
     assert!(settings.starts_with("HTTP/1.1 200"), "{settings}");
     wait_for("the new settings", || snapshot(&addr).contains(r#""steps":0,"mult":2.1,"z":1.5"#));
 
+    // A trade frequency level sets the rules and the track record check together, and is remembered.
+    let freq = request(&addr, "POST", "/api/settings", ui.as_deref(), "frequency=active");
+    assert!(freq.starts_with("HTTP/1.1 200"), "{freq}");
+    wait_for("the active level", || snapshot(&addr).contains(r#""z":0,"trackZ":0,"trackMin":20,"frequency":"active""#));
+    assert_eq!(std::fs::read_to_string(dir.join("trade-frequency.txt")).unwrap(), "active");
+
     wait_for("the tick log", || {
         std::fs::read_to_string(dir.join("ticks").join("EURUSD_otc.csv")).is_ok_and(|s| s.lines().count() > 10_000)
     });
@@ -424,7 +430,75 @@ fn balance_can_be_set_or_follow_pocket_option() {
     post("/ingest", ext, "balance\n1,52863.9\n");
     wait_for("the balance to follow", || snapshot(&addr).contains(r#""balance":52863.9,"startBalance":52340.5,"sync":true"#));
 
+    assert_eq!(std::fs::read_to_string(dir.join("pocket-option-balance.txt")).unwrap(), "87.25\n52863.9\n");
+
     // Typing a balance goes back to a paper account at that amount.
     post("/api/settings", Some(&ui), "balance=5000");
     wait_for("the paper balance", || snapshot(&addr).contains(r#""balance":5000,"startBalance":5000,"sync":false"#));
+}
+
+#[test]
+fn auto_mode_keeps_to_its_pair_list_and_stays_on_a_losing_pair() {
+    let addr = free_addr();
+    let dir = std::env::temp_dir().join(format!("daytrade-hold-{}", std::process::id()));
+    let child = Command::new(BIN)
+        .args(["pocket", "--quiet", "--no-color", "--ui-addr", &addr, "--data-dir"])
+        .arg(&dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _running = Running(child, dir.clone());
+    wait_for("the UI server", || TcpStream::connect(&addr).is_ok());
+    let ext = Some("chrome-extension://smoke-test");
+    let ui = format!("http://{addr}");
+    let post = |path: &str, origin: Option<&str>, body: &str| {
+        let r = request(&addr, "POST", path, origin, body);
+        assert!(r.starts_with("HTTP/1.1 200"), "{path}: {r}");
+    };
+    let orders = || {
+        let r = request(&addr, "GET", "/bridge/orders", ext, "");
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        r.split("\r\n\r\n").nth(1).unwrap().lines().map(str::to_owned).collect::<Vec<_>>()
+    };
+
+    // Both pairs alternate colour every one-second candle; `flip` breaks the pattern once.
+    let start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 - 600;
+    let close = |k: i64| if k % 2 == 0 { 1.0852 } else { 1.0848 };
+    let candle = |asset: &str, k: i64| format!("{asset},{k}.0,1.08500\n{asset},{k}.5,{:.5}\n", close(k));
+    let flip = |asset: &str, k: i64| format!("{asset},{k}.0,1.08500\n{asset},{k}.5,{:.5}\n", close(k - 1));
+    let history = |asset: &str| format!("history\n{}", (start..start + 590).map(|k| candle(asset, k)).collect::<String>());
+    post("/ingest", ext, "assets\nEURUSD_otc,92,1,currency,EUR/USD OTC\nGBPUSD_otc,92,1,currency,GBP/USD OTC\n");
+    post("/ingest", ext, &history("EURUSD_otc"));
+    post("/ingest", ext, &history("GBPUSD_otc"));
+    post("/ingest", ext, &format!("stream\nEURUSD_otc,{}.0,1.08500\n", start + 589));
+    wait_for("EURUSD_otc to go live", || snapshot(&addr).contains(r#""asset":"EURUSD_otc","tf""#));
+    post("/api/select", Some(&ui), "asset=EURUSD_otc&tf=1");
+    post("/api/settings", Some(&ui), "mode=demo&stake=5&auto=1&autoList=GBPUSD_otc");
+    wait_for("auto mode limited to GBP/USD", || {
+        let s = snapshot(&addr);
+        s.contains(r#""tf":1,"#) && s.contains(r#""phase":"live""#) && s.contains(r#""autoList":["GBPUSD_otc"]"#)
+    });
+
+    // EUR/USD signals first but isn't on the list; GBP/USD is traded, and its candle breaks the pattern.
+    post("/ingest", ext, &format!("stream\n{}", candle("EURUSD_otc", start + 590)));
+    post("/ingest", ext, &format!("stream\n{}", flip("GBPUSD_otc", start + 590)));
+    let first = orders();
+    assert!(first.iter().all(|l| l.contains(",GBPUSD_otc,")) && first.len() == 1, "{first:?}");
+
+    // All pairs allowed again. Paused, the loss settles without a new trade.
+    post("/api/settings", Some(&ui), "autoList=&paused=1");
+    post("/ingest", ext, &format!("stream\nGBPUSD_otc,{}.0,1.08500\n", start + 591));
+    wait_for("the loss to be held on GBP/USD", || {
+        let s = snapshot(&addr);
+        s.contains(r#""heldOn":"GBPUSD_otc","autoList":[]"#) && s.contains(r#""outcome":"LOSS""#)
+    });
+
+    // EUR/USD signals first again, but the multiplied trade waits for GBP/USD.
+    post("/api/settings", Some(&ui), "paused=0");
+    wait_for("unpaused", || snapshot(&addr).contains(r#""paused":false"#));
+    post("/ingest", ext, &format!("stream\nEURUSD_otc,{}.0,1.08500\n", start + 591));
+    post("/ingest", ext, &format!("stream\nGBPUSD_otc,{}.5,{:.5}\nGBPUSD_otc,{}.0,1.08500\n", start + 591, close(start + 591), start + 592));
+    let next = orders();
+    assert!(!next.is_empty() && next.iter().all(|l| l.contains(",GBPUSD_otc,") && l.contains(",10.5,")), "{next:?}");
 }

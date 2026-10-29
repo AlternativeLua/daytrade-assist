@@ -6,6 +6,12 @@
 //! every candle. Every vote is scored against the next candle whether or not it
 //! is traded, and a rule is only traded while the lower confidence bound of its
 //! recent win rate clears the payout's break-even rate.
+//!
+//! Picking the best of 24 rules flatters whichever one got lucky lately, and on
+//! a feed with no lasting pattern that is usually a trend-follower riding the
+//! last move. So the engine also keeps a track record of its own picks, scored
+//! on the next candle like everything else. That record is out of sample by
+//! construction, and nothing is traded unless it too clears break-even.
 
 use crate::candle::Candle;
 use crate::indicators::{Bollinger, Ema, Rsi, Stochastic};
@@ -41,6 +47,58 @@ const TREND_MIN: f64 = 1.0;
 /// When qualified rules disagree, hold unless one side's bound leads by this much.
 const CONFLICT_GAP: f64 = 0.01;
 
+/// How readily the engine trades. Each level loosens the rules and the track
+/// record together; looser levels trade more of the candles they're unsure of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Frequency {
+    /// Rules and the track record must both beat break-even with confidence.
+    Careful,
+    /// Rules with confidence; the track record's plain win rate beats break-even.
+    Balanced,
+    /// Rules' and the track record's plain win rates beat break-even.
+    Active,
+    /// Rules with confidence, no track record check (how the app traded before it had one).
+    Unchecked,
+}
+
+impl Frequency {
+    pub const ALL: [Frequency; 4] = [Frequency::Careful, Frequency::Balanced, Frequency::Active, Frequency::Unchecked];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Frequency::Careful => "careful",
+            Frequency::Balanced => "balanced",
+            Frequency::Active => "active",
+            Frequency::Unchecked => "unchecked",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.name() == s.trim())
+    }
+
+    /// The level's `z`, `track_z` and `track_min`.
+    pub fn levels(self) -> (f64, f64, f64) {
+        match self {
+            Frequency::Careful => (1.0, 1.0, 40.0),
+            Frequency::Balanced => (1.0, 0.0, 20.0),
+            Frequency::Active => (0.0, 0.0, 20.0),
+            Frequency::Unchecked => (1.0, 1.0, 0.0),
+        }
+    }
+
+    /// Applies the level to `p`.
+    pub fn apply(self, p: Params) -> Params {
+        let (z, track_z, track_min) = self.levels();
+        Params { z, track_z, track_min, ..p }
+    }
+
+    /// The level `p` is set to, if it matches one.
+    pub fn of(p: &Params) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.levels() == (p.z, p.track_z, p.track_min))
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Params {
     /// Votes after which an old result counts half as much as a new one.
@@ -51,6 +109,12 @@ pub struct Params {
     pub min_samples: f64,
     /// Extra edge required above break-even.
     pub margin: f64,
+    /// Picks after which an old pick's result counts half in the track record.
+    pub track_half_life: f64,
+    /// Effective picks the track record needs before anything is traded; 0 turns the check off.
+    pub track_min: f64,
+    /// Confidence z for the track record's lower bound; 0 trades while its raw win rate beats break-even.
+    pub track_z: f64,
 }
 
 impl Default for Params {
@@ -60,6 +124,9 @@ impl Default for Params {
             z: 1.0,
             min_samples: 50.0,
             margin: 0.0,
+            track_half_life: 300.0,
+            track_min: 40.0,
+            track_z: 1.0,
         }
     }
 }
@@ -125,9 +192,51 @@ pub struct RuleScore {
     pub n: f64,
 }
 
+/// Why the engine isn't trading the next candle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hold {
+    /// No rule has enough votes yet.
+    Learning,
+    /// No rule's lower bound clears break-even.
+    NoEdge,
+    /// Qualified rules point both ways.
+    Conflict,
+    /// A rule qualifies, but the engine's own picks haven't been proven yet.
+    Proving,
+    /// A rule qualifies, but the engine's own recent picks don't beat break-even.
+    Unproven,
+}
+
+impl Hold {
+    pub fn name(self) -> &'static str {
+        match self {
+            Hold::Learning => "learning",
+            Hold::NoEdge => "no-edge",
+            Hold::Conflict => "conflict",
+            Hold::Proving => "proving",
+            Hold::Unproven => "unproven",
+        }
+    }
+}
+
+/// How the engine's own picks have done, traded or not.
+#[derive(Clone, Copy, Debug)]
+pub struct Track {
+    /// Recency-weighted win rate.
+    pub rate: f64,
+    pub lower: f64,
+    /// Recency-weighted picks.
+    pub n: f64,
+    pub wins: u32,
+    pub total: u32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Signal {
     pub side: Option<Side>,
+    /// Why there is no side; `None` when trading.
+    pub hold: Option<Hold>,
+    pub track: Track,
     /// The traded rule, or the strongest candidate when holding.
     pub best: Option<Pick>,
     pub voting: u8,
@@ -246,10 +355,15 @@ impl Indicators {
 pub struct Engine {
     p: Params,
     decay: f64,
+    track_decay: f64,
     threshold: f64,
     ind: Indicators,
     records: [Record; EXPERTS],
     pending: [i8; EXPERTS],
+    /// The engine's own picks, scored whether or not they were traded.
+    track: Record,
+    /// Direction picked for the next candle (+1, -1, or 0 for none).
+    track_vote: i8,
     /// Candles learned from, including ones learned in earlier sessions.
     candles: u64,
 }
@@ -259,10 +373,13 @@ impl Engine {
         Self {
             p,
             decay: 0.5f64.powf(1.0 / p.half_life.max(1.0)),
+            track_decay: 0.5f64.powf(1.0 / p.track_half_life.max(1.0)),
             threshold: breakeven + p.margin,
             ind: Indicators::new(),
             records: [Record::default(); EXPERTS],
             pending: [0; EXPERTS],
+            track: Record::default(),
+            track_vote: 0,
             candles: 0,
         }
     }
@@ -272,8 +389,11 @@ impl Engine {
         self.threshold = breakeven + self.p.margin;
     }
 
-    pub fn set_z(&mut self, z: f64) {
-        self.p.z = z;
+    /// Changes how readily it trades; what has been learned is kept.
+    pub fn set_frequency(&mut self, p: &Params) {
+        self.p.z = p.z;
+        self.p.track_z = p.track_z;
+        self.p.track_min = p.track_min;
     }
 
     pub fn records(&self) -> &[Record; EXPERTS] {
@@ -284,11 +404,36 @@ impl Engine {
         self.candles
     }
 
+    pub fn track_record(&self) -> Record {
+        self.track
+    }
+
+    /// The engine's own picks so far, and how sure that record is.
+    pub fn track(&self) -> Track {
+        let t = &self.track;
+        Track {
+            rate: if t.n > 0.0 { t.w / t.n } else { 0.0 },
+            lower: wilson_lower(t.w, t.n, self.p.track_z),
+            n: t.n,
+            wins: t.wins,
+            total: t.total,
+        }
+    }
+
+    /// Whether the engine's own picks are beating break-even with confidence.
+    pub fn proven(&self) -> bool {
+        self.p.track_min <= 0.0 || (self.track.n >= self.p.track_min && self.track().lower > self.threshold)
+    }
+
     /// Replaces what has been learned with saved training. Indicators and the
-    /// votes waiting for the next candle are kept.
-    pub fn restore(&mut self, records: [Record; EXPERTS], candles: u64) {
+    /// votes waiting for the next candle are kept, and so is the track record
+    /// when the saved training has none (it was saved before there was one).
+    pub fn restore(&mut self, records: [Record; EXPERTS], candles: u64, track: Option<Record>) {
         self.records = records;
         self.candles = candles;
+        if let Some(t) = track {
+            self.track = t;
+        }
     }
 
     /// The rule with the highest lower bound among those with enough votes.
@@ -324,12 +469,17 @@ impl Engine {
                     rec.record(vote == color, self.decay);
                 }
             }
+            if self.track_vote != 0 {
+                self.track.record(self.track_vote == color, self.track_decay);
+            }
         }
 
         let (bases, rsi, z) = self.ind.update(c);
         let most = self.records.iter().map(|r| r.n).fold(0.0, f64::max);
         let mut sig = Signal {
             side: None,
+            hold: Some(if most < self.p.min_samples { Hold::Learning } else { Hold::NoEdge }),
+            track: self.track(),
             best: None,
             voting: 0,
             learning: (most < self.p.min_samples).then_some(most),
@@ -375,11 +525,21 @@ impl Engine {
             (Some(c), Some(p)) if (c.lower - p.lower).abs() > CONFLICT_GAP => {
                 Some(if c.lower > p.lower { c } else { p })
             }
+            (Some(_), Some(_)) => {
+                sig.hold = Some(Hold::Conflict);
+                None
+            }
             _ => None,
         };
+        self.track_vote = chosen.map_or(0, |p| if p.side == Side::Call { 1 } else { -1 });
         if let Some(pick) = chosen {
-            sig.side = Some(pick.side);
             sig.best = Some(pick);
+            if self.proven() {
+                sig.side = Some(pick.side);
+                sig.hold = None;
+            } else {
+                sig.hold = Some(if self.track.n < self.p.track_min { Hold::Proving } else { Hold::Unproven });
+            }
         }
         sig
     }
@@ -423,6 +583,47 @@ mod tests {
         assert_eq!(expert_name(sig.best.unwrap().expert).0, "fade");
     }
 
+    /// Coin-flip candles from a fixed seed.
+    fn noise(e: &mut Engine, n: i64) -> (u32, u32) {
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let (mut traded, mut picked) = (0, 0);
+        for i in 0..n {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let up = rng & 1 == 1;
+            let sig = e.on_close(&candle(i, 1.0, if up { 1.0001 } else { 0.9999 }));
+            traded += sig.side.is_some() as u32;
+            picked += sig.best.is_some() as u32;
+        }
+        (traded, picked)
+    }
+
+    #[test]
+    fn stands_aside_on_noise_its_picks_cant_beat() {
+        // Short memory and loose selectivity: some lucky rule qualifies on noise most of the time.
+        let p = Params { z: 0.0, half_life: 60.0, min_samples: 30.0, ..Params::default() };
+        let mut gated = Engine::new(p, 1.0 / 1.85);
+        let mut ungated = Engine::new(Params { track_min: 0.0, ..p }, 1.0 / 1.85);
+        let (traded, _) = noise(&mut gated, 6000);
+        let (traded_before, _) = noise(&mut ungated, 6000);
+        assert!(traded_before > 300, "the rules alone trade noise: {traded_before}");
+        assert!(traded * 4 < traded_before, "the track record should cut most of it: {traded} vs {traded_before}");
+        assert!(gated.track().total > 300, "picks are still scored while holding");
+    }
+
+    #[test]
+    fn restore_keeps_the_track_record_when_none_was_saved() {
+        let mut e = Engine::new(Params { z: 0.0, half_life: 60.0, min_samples: 30.0, ..Params::default() }, 0.54);
+        noise(&mut e, 2000);
+        let before = e.track().total;
+        assert!(before > 0);
+        e.restore(*e.records(), e.candles(), None);
+        assert_eq!(e.track().total, before);
+        e.restore(*e.records(), e.candles(), Some(Record::default()));
+        assert_eq!(e.track().total, 0);
+    }
+
     #[test]
     fn holds_while_learning() {
         let mut e = Engine::new(Params::default(), 0.54);
@@ -430,6 +631,7 @@ mod tests {
             let sig = e.on_close(&candle(i, 1.0, 1.0 + if i % 2 == 0 { 1e-4 } else { -1e-4 }));
             assert!(sig.side.is_none());
             assert!(sig.learning.is_some());
+            assert_eq!(sig.hold, Some(Hold::Learning));
         }
     }
 

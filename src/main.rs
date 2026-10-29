@@ -79,6 +79,9 @@ OPTIONS:
     --margin <F>        Extra win rate required above break-even      [default: 0]
     --min-samples <N>   Votes a rule needs before it can be traded     [default: 50]
     --half-life <N>     Votes until old results count half (adaptivity) [default: 400]
+    --track-min <N>     Picks the bot's own track record needs before it trades;
+                        0 trades on the rules alone                     [default: 40]
+    --track-half-life <N>  Picks until an old pick counts half in that record [default: 300]
 
   sim:
     --minutes <N>       [default: 600]    --seed <N>       [default: 1]
@@ -239,6 +242,9 @@ fn parse_args() -> Result<Config, String> {
             "--margin" => num!(cfg.params.margin),
             "--min-samples" => num!(cfg.params.min_samples),
             "--half-life" => num!(cfg.params.half_life),
+            "--track-min" => num!(cfg.params.track_min),
+            "--track-z" => num!(cfg.params.track_z),
+            "--track-half-life" => num!(cfg.params.track_half_life),
             "--minutes" => num!(cfg.sim.minutes),
             "--seed" => num!(cfg.sim.seed),
             "--step-ms" => num!(cfg.sim.step_ms),
@@ -382,6 +388,7 @@ fn run(cfg: &'static Config) -> io::Result<()> {
                 balance: cfg.balance,
                 z: cfg.params.z,
                 min_samples: cfg.params.min_samples,
+                track_min: cfg.params.track_min,
             },
             registry.clone(),
             tx.clone(),

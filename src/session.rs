@@ -12,7 +12,7 @@ use crate::feed::{AssetId, Input, Registry, Tick, TradeMode};
 use crate::latency::{Histogram, Ns};
 use crate::paper::{Martingale, Outcome, Paper, Settlement, Trade};
 use crate::power::{Awake, KeepAwake};
-use crate::strategy::{EXPERTS, Engine, Params, Pick, Side, Signal, expert_name};
+use crate::strategy::{EXPERTS, Engine, Frequency, Hold, Params, Pick, Side, Signal, expert_name};
 use crate::feed::now_ms;
 use crate::training::{self, Learner, Store, TIMEFRAMES_MS};
 use crate::ui::{AssetInfo, Event, OrderSent, Phase, Status, TrainingRow, Ui};
@@ -94,7 +94,10 @@ pub struct Session {
     payouts: HashMap<AssetId, (f64, bool)>,
     can_trade: bool,
     martingale: Martingale,
-    z: f64,
+    /// Strategy settings, with the trade frequency the UI last chose.
+    params: Params,
+    /// Where the chosen trade frequency is kept between sessions.
+    frequency_path: Option<PathBuf>,
     stake: f64,
     stake_pct: f64,
     /// Whether live paper trades are also placed on Pocket Option, and on which account.
@@ -121,12 +124,19 @@ pub struct Session {
     auto: bool,
     /// Asset and timeframe of the open paper trade.
     trade_on: Option<(AssetId, i64)>,
+    /// Where the last loss happened. In auto mode the multiplied trade that
+    /// follows stays on that pair rather than going to another one.
+    run_on: Option<(AssetId, i64)>,
+    /// Pairs auto mode may trade; empty means every pair.
+    auto_list: Vec<String>,
     /// Starting balance for a fresh paper account.
     balance: f64,
     /// Follow the Pocket Option balance of the account trades go to.
     sync: bool,
-    /// Latest Pocket Option balances: real, demo.
+    /// Latest Pocket Option balances: real, demo. Kept on disk, because
+    /// Pocket Option only reports them when its tab loads or after a trade.
     po_balance: [Option<f64>; 2],
+    balance_path: Option<PathBuf>,
 }
 
 impl Session {
@@ -148,6 +158,14 @@ impl Session {
             None => None,
         };
         let training_path = cfg.data_dir.as_ref().map(|d| d.join("training.txt"));
+        let balance_path = cfg.data_dir.as_ref().map(|d| d.join("pocket-option-balance.txt"));
+        let frequency_path = cfg.data_dir.as_ref().map(|d| d.join("trade-frequency.txt"));
+        let saved_frequency = frequency_path
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| Frequency::parse(&s));
+        let params = saved_frequency.map_or(cfg.params, |f| f.apply(cfg.params));
+        let po_balance = balance_path.as_deref().map_or([None, None], load_balances);
         let store = training_path.as_deref().map(training::load).unwrap_or_default();
         let mut periods = TIMEFRAMES_MS.to_vec();
         if !periods.contains(&cfg.period_ms.max(MIN_PERIOD_MS)) {
@@ -164,7 +182,7 @@ impl Session {
             series: Vec::new(),
             active: None,
             switched_to_real: false,
-            learner: Learner::new(cfg.period_ms, cfg.params, paper.breakeven(), None),
+            learner: Learner::new(cfg.period_ms, params, paper.breakeven(), None),
             paper,
             close_lat: Histogram::default(),
             tick_lat: Histogram::default(),
@@ -182,7 +200,8 @@ impl Session {
             payouts: HashMap::new(),
             can_trade: true,
             martingale,
-            z: cfg.params.z,
+            params,
+            frequency_path,
             stake: cfg.stake,
             stake_pct: cfg.stake_pct,
             mode: TradeMode::Off,
@@ -202,9 +221,12 @@ impl Session {
             awake_guard: None,
             auto: cfg.auto,
             trade_on: None,
+            run_on: None,
+            auto_list: Vec::new(),
             balance: cfg.balance,
             sync: false,
-            po_balance: [None, None],
+            po_balance,
+            balance_path,
         })
     }
 
@@ -235,11 +257,20 @@ impl Session {
                         self.martingale.mult = mult;
                     }
                     self.paper.set_martingale(self.martingale);
-                    if let Some(z) = change.z {
-                        self.z = z;
-                        self.learner.engine.set_z(z);
+                    if change.z.is_some() || change.frequency.is_some() {
+                        if let Some(f) = change.frequency {
+                            self.params = f.apply(self.params);
+                            if let Some(path) = &self.frequency_path {
+                                let _ = std::fs::write(path, f.name());
+                            }
+                        }
+                        if let Some(z) = change.z {
+                            self.params.z = z;
+                        }
+                        let p = self.params;
+                        self.learner.engine.set_frequency(&p);
                         for l in self.series.iter_mut().flat_map(|s| &mut s.learners) {
-                            l.engine.set_z(z);
+                            l.engine.set_frequency(&p);
                         }
                         self.push_training();
                     }
@@ -283,10 +314,17 @@ impl Session {
                     if let Some(auto) = change.auto {
                         self.auto = auto;
                     }
+                    if let Some(list) = change.auto_list {
+                        self.auto_list = list;
+                    }
                     self.push_status();
                 }
                 Input::Balance { demo, balance } => {
                     self.po_balance[demo as usize] = Some(balance);
+                    if let Some(path) = &self.balance_path {
+                        let line = |b: Option<f64>| b.map_or(String::new(), |b| b.to_string());
+                        let _ = std::fs::write(path, format!("{}\n{}\n", line(self.po_balance[0]), line(self.po_balance[1])));
+                    }
                     self.apply_sync(false);
                     self.push_status();
                 }
@@ -331,7 +369,7 @@ impl Session {
     }
 
     fn params(&self) -> Params {
-        Params { z: self.z, ..self.cfg.params }
+        self.params
     }
 
     /// A learner starting from whatever was saved for this asset and timeframe.
@@ -404,11 +442,16 @@ impl Session {
             .iter()
             .filter(|s| !s.ticks.is_empty())
             .flat_map(|s| {
-                s.learners.iter().map(|l| TrainingRow {
-                    asset: s.name.clone(),
-                    period_ms: l.agg.period_ms(),
-                    candles: l.candles(),
-                    best: l.strongest(),
+                s.learners.iter().map(|l| {
+                    let (best, track, proven) = l.standing();
+                    TrainingRow {
+                        asset: s.name.clone(),
+                        period_ms: l.agg.period_ms(),
+                        candles: l.candles(),
+                        best,
+                        track,
+                        proven,
+                    }
                 })
             })
             .collect();
@@ -508,6 +551,9 @@ impl Session {
             return Ok(());
         }
         let Some(side) = sig.side else { return Ok(()) };
+        if !self.auto_allows(id) || self.held_run().is_some_and(|run| run != (id, period_ms)) {
+            return Ok(());
+        }
         // Only pairs of the same kind as the one on screen: live feeds, or simulated demo pairs.
         let demo = is_demo(&self.series[id as usize].name);
         let same_kind = self.active.is_some_and(|a| is_demo(&self.series[a as usize].name) == demo);
@@ -531,6 +577,7 @@ impl Session {
     /// Settles the open trade on `closed`, and counts it toward the real-money loss limit.
     fn settle(&mut self, closed: &Candle) -> Option<Settlement> {
         let s = self.paper.settle(closed)?;
+        self.run_on = if self.paper.step > 0 { self.trade_on } else { None };
         self.trade_on = None;
         if std::mem::replace(&mut self.open_mirror, TradeMode::Off) == TradeMode::Real {
             self.count_real(s.pnl);
@@ -547,6 +594,21 @@ impl Session {
                 -self.real_pnl, self.loss_limit
             ));
         }
+    }
+
+    /// The pair a run of losses is held on, while it can still be traded
+    /// there: same timeframe, still streaming, open and paying enough.
+    /// Otherwise the multiplied stake goes to whichever pair signals next.
+    fn held_run(&self) -> Option<(AssetId, i64)> {
+        let (id, period_ms) = self.run_on.filter(|_| self.paper.in_run())?;
+        let streaming = now_ms() - self.series[id as usize].seen_ms < 2 * period_ms + 10_000;
+        let ok = period_ms == self.learner.agg.period_ms() && streaming && self.tradeable(id) && self.auto_allows(id);
+        ok.then_some((id, period_ms))
+    }
+
+    /// Whether the pair is on the list auto mode may trade (all pairs when the list is empty).
+    fn auto_allows(&self, id: AssetId) -> bool {
+        self.auto_list.is_empty() || self.auto_list.contains(&self.series[id as usize].name)
     }
 
     /// Drops the open trade once its pair has sent no prices for two candles,
@@ -681,7 +743,7 @@ impl Session {
         // Auto mode's account and open trade carry on; the replay gets an account of its own.
         let kept = if self.auto {
             let fresh = self.new_paper();
-            Some((std::mem::replace(&mut self.paper, fresh), self.trade_on.take(), self.open_pick.take(), self.open_mirror))
+            Some((std::mem::replace(&mut self.paper, fresh), self.trade_on.take(), self.open_pick.take(), self.open_mirror, self.run_on))
         } else {
             None
         };
@@ -733,11 +795,12 @@ impl Session {
         }
         self.replay_candles = Vec::new();
         self.reset_account();
-        if let Some((paper, trade_on, pick, mirror)) = kept {
+        if let Some((paper, trade_on, pick, mirror, run_on)) = kept {
             self.paper = paper;
             self.trade_on = trade_on;
             self.open_pick = pick;
             self.open_mirror = mirror;
+            self.run_on = run_on;
         }
         self.phase(Phase::Live);
         self.push_assets();
@@ -807,11 +870,16 @@ impl Session {
                 step: self.paper.step,
                 steps: self.martingale.steps,
                 mult: self.martingale.mult,
-                z: self.z,
+                z: self.params.z,
+                track_z: self.params.track_z,
+                track_min: self.params.track_min,
+                frequency: Frequency::of(&self.params),
                 awake: self.awake,
                 awake_ok: self.awake == Awake::Off || self.awake_guard.is_some(),
                 auto: self.auto,
                 auto_pairs: self.auto_pairs(),
+                held_on: self.held_run().filter(|_| self.auto).map(|(id, _)| self.series[id as usize].name.clone()),
+                auto_list: self.auto_list.clone(),
                 balance: self.paper.balance,
                 start_balance: self.paper.start_balance,
                 sync: self.sync,
@@ -830,7 +898,7 @@ impl Session {
         (0..self.series.len() as AssetId)
             .filter(|&i| {
                 let s = &self.series[i as usize];
-                is_demo(&s.name) == demo && now - s.seen_ms < STREAMING_MS && self.tradeable(i)
+                is_demo(&s.name) == demo && now - s.seen_ms < STREAMING_MS && self.tradeable(i) && self.auto_allows(i)
             })
             .count()
     }
@@ -901,6 +969,7 @@ impl Session {
         self.signals = 0;
         self.open_pick = None;
         self.trade_on = None;
+        self.run_on = None;
         self.open_mirror = TradeMode::Off;
     }
 
@@ -1021,6 +1090,13 @@ impl Session {
     }
 }
 
+/// The real and demo balances saved by an earlier session, one per line.
+fn load_balances(path: &std::path::Path) -> [Option<f64>; 2] {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines = text.lines().map(|l| l.trim().parse::<f64>().ok().filter(|b| b.is_finite() && *b >= 0.0));
+    [lines.next().flatten(), lines.next().flatten()]
+}
+
 /// Asset names become file names; anything unusual is replaced.
 pub fn log_file_name(asset: &str) -> String {
     let safe: String = asset
@@ -1110,7 +1186,19 @@ impl Printer {
                 self.time(c.slot + 2),
             )?,
             (Some(side), None) => write!(out, "{} (skipped: {skipped})", self.side_label(side))?,
-            (None, _) => write!(out, "{}", self.paint("2", &format!("hold   best: {}", self.rule(sig))))?,
+            (None, _) => {
+                let why = match sig.hold {
+                    Some(Hold::Conflict) => "rules disagree".to_owned(),
+                    Some(Hold::Proving) => format!("proving its picks ({:.0} so far)", sig.track.n),
+                    Some(Hold::Unproven) => format!(
+                        "its picks win {:.1}% (≥{:.1}%), not enough",
+                        sig.track.rate * 100.0,
+                        sig.track.lower * 100.0
+                    ),
+                    _ => "no edge".to_owned(),
+                };
+                write!(out, "{}", self.paint("2", &format!("hold ({why})   best: {}", self.rule(sig))))?
+            }
         }
         writeln!(out, "  {}", Ns(ns))
     }

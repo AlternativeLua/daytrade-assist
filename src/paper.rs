@@ -103,6 +103,11 @@ impl Paper {
         if self.step > 0 && self.balance < self.stake_at(self.step) { 0 } else { self.step }
     }
 
+    /// Whether the next trade continues a run of losses at a multiplied stake.
+    pub fn in_run(&self) -> bool {
+        self.next_step() > 0
+    }
+
     /// Stake the next trade would use.
     pub fn next_stake(&self) -> f64 {
         self.stake_at(self.next_step())

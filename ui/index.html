@@ -64,6 +64,19 @@
   .countdown .lbl { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-top: 4px; }
   .headsup { margin-top: 10px; padding: 7px 10px; border-radius: 8px; background: var(--warn-soft); color: var(--warn); font-weight: 600; display: none; }
   .ind { display: flex; justify-content: space-around; margin-top: 10px; color: var(--muted); font-size: 12px; }
+  .proof { margin-top: 12px; padding: 10px 11px; border-radius: 8px; background: var(--panel-2); }
+  .proof-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12px; color: var(--muted); }
+  .proof-head b { color: var(--text); font-weight: 600; }
+  .chip { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; white-space: nowrap; background: var(--line); color: var(--muted); }
+  .chip.ok { color: var(--up); background: var(--up-soft); } .chip.wait { color: var(--warn); background: var(--warn-soft); } .chip.no { color: var(--down); background: var(--down-soft); }
+  .proof .track { position: relative; height: 8px; background: var(--line); border-radius: 4px; }
+  .proof .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; background: var(--faint); }
+  .proof .lb { position: absolute; top: 0; bottom: 0; border-radius: 4px; background: rgba(255,255,255,.18); }
+  .proof .be { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--warn); }
+  .proof .lbl { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 5px; gap: 8px; white-space: nowrap; }
+  .proof .why { color: var(--muted); font-size: 12px; margin-top: 8px; line-height: 1.4; }
+  .settings .grp { grid-column: 1 / -1; font-size: 10px; text-transform: uppercase; letter-spacing: .09em; color: var(--faint); font-weight: 700; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .settings .grp:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
 
   .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
   .stat .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
@@ -91,6 +104,10 @@
   .risk li { margin-bottom: 6px; }
   .confirm-row { display: flex; gap: 8px; align-items: center; margin: 10px 0; }
   .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+  .picklist { max-height: 50vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; margin-top: 10px; }
+  .picklist label { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .picklist label:last-child { border-bottom: 0; }
+  .picklist .grow { flex: 1; }
   .btn.danger { background: var(--down); }
   .btn:disabled { opacity: .45; cursor: not-allowed; }
   .dlg-body input[type=text], .dlg-body input[type=number] { background: var(--panel-2); color: var(--text); border: 1px solid var(--line-2); border-radius: 6px; padding: 6px 8px; font: inherit; width: 100%; }
@@ -104,6 +121,7 @@
   td.tcell { cursor: pointer; white-space: nowrap; }
   td.tcell:hover { background: var(--panel-2); }
   td.tcell.q { color: var(--up); font-weight: 600; }
+  td.tcell.c { color: var(--warn); }
   td.tcell.sel { box-shadow: inset 0 0 0 1px var(--accent); }
   td.tcell .muted { font-weight: 400; }
   .pill.flag { color: var(--accent); border-color: transparent; background: var(--panel-2); }
@@ -210,6 +228,12 @@
         <div class="name" id="ruleName"></div>
         <div class="meta num" id="ruleMeta"></div>
       </div>
+      <div class="proof" id="proof" style="display:none">
+        <div class="proof-head"><span><b>Track record</b> · the bot's own recent picks</span><span class="chip" id="proofChip"></span></div>
+        <div class="track" title="Bar: recent win rate of the bot's picks. Light band: how much of it is proven (lower confidence bound). Orange line: break-even."><div class="fill" id="proofFill"></div><div class="lb" id="proofLb"></div><div class="be" id="proofBe"></div></div>
+        <div class="lbl num"><span id="proofText"></span><span id="proofBeText"></span></div>
+        <div class="why" id="proofWhy"></div>
+      </div>
       <div class="headsup" id="headsup"></div>
       <div class="countdown" id="countdown" style="display:none">
         <div class="bar"><div class="fill" id="cdFill"></div></div>
@@ -232,6 +256,7 @@
       </div>
       <div class="gate" id="gate"></div>
       <div class="settings">
+        <div class="grp">Money</div>
         <span>Balance</span>
         <select id="setSync">
           <option value="0">Paper balance</option>
@@ -261,18 +286,24 @@
           <option value="2.2">×2.2</option>
           <option value="2.5">×2.5</option>
         </select>
-        <span>Selectivity</span>
-        <select id="setZ">
-          <option value="0">Loose (most signals)</option>
-          <option value="1">Normal</option>
-          <option value="1.5">Strict</option>
-          <option value="2">Very strict (fewest signals)</option>
+        <div class="grp">Strategy</div>
+        <span>Trade frequency</span>
+        <select id="setFreq">
+          <option value="careful">Careful (fewest trades)</option>
+          <option value="balanced">Balanced</option>
+          <option value="active">Active</option>
+          <option value="unchecked">No track record check</option>
+          <option value="custom" disabled hidden>Custom (command line)</option>
         </select>
+        <span></span><span class="fine" id="freqNote"></span>
         <span>Pairs traded</span>
         <select id="setAuto">
           <option value="0">Selected pair only</option>
           <option value="1">Auto: any streaming pair</option>
         </select>
+        <span>Auto pairs</span>
+        <button class="btn ghost" id="autoPairsBtn" type="button">All pairs</button>
+        <div class="grp">Running</div>
         <span>Sleep</span>
         <select id="setAwake">
           <option value="off">Let this computer sleep</option>
@@ -355,7 +386,7 @@
       <div class="scroll"><table><thead><tr>
         <th>Rule</th><th>Recent win rate</th><th class="r">Recent</th><th class="r">Lower bound</th><th class="r">Votes (recent)</th><th class="r">All-time</th><th class="r">All votes</th>
       </tr></thead><tbody id="rulesRows"></tbody></table></div>
-      <div class="note">For the selected pair and timeframe. Green rules are tradeable now: their win rate's lower confidence bound is above break-even. Every vote is scored, traded or not. The best of 24 rules will look good partly by luck.</div>
+      <div class="note">For the selected pair and timeframe. Green rules qualify: their win rate's lower confidence bound is above break-even. Every vote is scored, traded or not. The best of 24 rules will look good partly by luck, so a qualifying rule is only traded while the bot's own track record (in the signal card) also beats break-even.</div>
     </div>
 
     <div class="pane" id="tab-training">
@@ -364,6 +395,16 @@
     </div>
   </section>
 </main>
+
+<dialog id="autoDlg">
+  <div class="dlg-head"><h2>Pairs auto mode may trade</h2><button class="x" data-close aria-label="Close">×</button></div>
+  <div class="dlg-body">
+    <p style="margin-top:0">Auto mode only trades the ticked pairs. With none ticked, it trades any pair. A pair still has to be open in Pocket Option, and paying at least the minimum payout, to be traded.</p>
+    <div style="display:flex;gap:8px"><button class="btn ghost" id="autoPickHigh" type="button">Tick pairs paying the minimum or more</button><button class="btn ghost" id="autoPickNone" type="button">Untick all</button></div>
+    <div class="picklist" id="autoPickList"></div>
+    <div class="dlg-actions"><button class="btn ghost" data-close>Cancel</button><button class="btn" id="autoPickSave">Save</button></div>
+  </div>
+</dialog>
 
 <dialog id="demoDlg">
   <div class="dlg-head"><h2>Trade on the demo account?</h2><button class="x" data-close aria-label="Close">×</button></div>
@@ -638,7 +679,7 @@ function handle(m) {
       S.open = m.open; renderMarkers(); renderAccount();
       break;
     case 'training':
-      S.training = m.training; renderTraining();
+      S.training = m.training; renderTraining(); renderAccount();
       break;
     case 'market':
       S.market = m.market; assetKey = ''; renderAssets(); renderPayouts(); renderAccount();
@@ -697,20 +738,56 @@ function renderSignal() {
     sub.textContent = S.open ? `entry ${fmtPx(S.open.entry)} · ${clock(start)} → ${clock(start + period)}`
       : S.status && !S.status.canTrade ? `not traded: ${gateReason()}` : `candle ${clock(start)}`;
   } else {
-    dir.textContent = 'HOLD'; dir.className = 'dir hold';
-    sub.textContent = 'no rule is clearly beating break-even';
+    const would = sig.best ? (sig.best.side === 'CALL' ? 'CALL ▲' : 'PUT ▼') : '';
+    const aside = sig.hold === 'proving' || sig.hold === 'unproven';
+    dir.textContent = aside ? 'STAND ASIDE' : 'HOLD'; dir.className = 'dir hold';
+    sub.textContent = {
+      conflict: 'qualified rules disagree on direction',
+      proving: `a rule says ${would}, but the bot is still proving its picks`,
+      unproven: `a rule says ${would}, but the bot's recent picks aren't winning enough`,
+    }[sig.hold] || 'no rule is clearly beating break-even';
   }
   if (sig && sig.best && sig.learning == null && S.phase !== 'history') {
     $('ruleBox').style.display = '';
     $('ruleName').textContent = (sig.side ? '' : 'best candidate: ') + sig.best.rule;
     $('ruleMeta').textContent = `win ${pct(sig.best.rate)} · lower bound ${pct(sig.best.lower)} · n ${Math.round(sig.best.n)} · need > ${pct(be())}`;
   }
+  renderProof(sig);
   $('ind').innerHTML = sig && S.phase !== 'history' ? `<span>RSI ${sig.rsi == null ? '—' : sig.rsi.toFixed(1)}</span><span>z ${sig.z == null ? '—' : (sig.z >= 0 ? '+' : '') + sig.z.toFixed(2)}</span><span>${sig.voting} rules voting</span>` : '';
   const hu = $('headsup'), pv = S.preview;
   if (pv && pv.signal.side && S.forming && pv.slot * S.tf === S.forming[0]) {
     hu.style.display = 'block';
     hu.textContent = `Heads-up: ${pv.signal.side} likely at ${clock((pv.slot + 1) * period)} · ${pv.signal.best ? pv.signal.best.rule : ''}`;
   } else hu.style.display = 'none';
+}
+
+const trackMin = () => S.status ? S.status.trackMin : S.cfg && S.cfg.trackMin != null ? S.cfg.trackMin : 40;
+// The engine only trades while its own picks, scored candle by candle, beat break-even.
+// Picking the best of 24 rules flatters whichever got lucky lately, so this is the honest number.
+function proofState(track, proven, trackMin) {
+  if (!track || track.n < 0.5) return { cls: '', chip: 'No picks yet' };
+  if (track.n < trackMin) return { cls: 'wait', chip: `Proving · ${Math.floor(track.n)}/${trackMin}` };
+  return proven ? { cls: 'ok', chip: 'Edge confirmed' } : { cls: 'no', chip: 'Standing aside' };
+}
+function renderProof(sig) {
+  const box = $('proof');
+  if (!sig || !sig.track || sig.learning != null || S.phase === 'history') { box.style.display = 'none'; return; }
+  box.style.display = '';
+  const t = sig.track, b = be(), min = trackMin();
+  const proven = min <= 0 || (t.n >= min && t.lower > b);
+  const st = proofState(t, proven, min);
+  $('proofChip').className = 'chip ' + st.cls; $('proofChip').textContent = st.chip;
+  $('proofFill').style.width = (t.rate * 100) + '%';
+  $('proofFill').style.background = t.n < min ? 'var(--faint)' : t.rate > b ? 'var(--up)' : 'var(--down)';
+  $('proofLb').style.left = (Math.min(t.lower, t.rate) * 100) + '%';
+  $('proofLb').style.width = (Math.abs(t.rate - t.lower) * 100) + '%';
+  $('proofBe').style.left = (b * 100) + '%';
+  $('proofText').textContent = t.n >= 0.5 ? `${pct(t.rate)} won · ≥${pct(t.lower)} proven · ${t.total.toLocaleString()} picks` : 'no picks scored yet';
+  $('proofBeText').textContent = `need ${pct(b)}`;
+  $('proofWhy').textContent = min <= 0 ? 'Track record check is off (Trade frequency): trades on the rules alone.'
+    : t.n < min ? `Every pick is scored on the next candle, traded or not. Trading starts once ${min} picks show a win rate above break-even. Trade frequency in the account card sets how strict this is.`
+    : proven ? 'Its picks are beating break-even with confidence, so signals are traded.'
+    : 'Its recent picks aren\'t beating break-even, often because a trend broke or the market went choppy. It keeps scoring picks and resumes by itself once they win again. Trade frequency in the account card sets how strict this is.';
 }
 
 function tally(trades) {
@@ -745,23 +822,27 @@ function renderAccount() {
     const stake = s2.steps ? ` · next stake ${s2.nextStake.toFixed(2)}${s2.step ? ` (after ${s2.step} loss${s2.step > 1 ? 'es' : ''})` : ''}` : ` · stake ${s2.nextStake.toFixed(2)}`;
     const where = s2.mode === 'off' ? '' : isDemo(S.asset) ? ' · demo pair, paper only' : s2.mode === 'real' ? ' · placing REAL-money orders' : ' · placing on Pocket Option demo';
     const autoWhere = s2.mode === 'off' ? '' : isDemo(S.asset) ? ' · demo pairs, paper only' : s2.mode === 'real' ? ' · placing REAL-money orders' : ' · placing on Pocket Option demo';
-    const autoOpen = S.open && S.open.asset ? ` · open: ${S.open.side} ${pairName(S.open.asset)}` : '';
+    const autoOpen = S.open && S.open.asset ? ` · open: ${S.open.side} ${pairName(S.open.asset)}`
+      : s2.heldOn ? ` · after a loss, the next trade stays on ${pairName(s2.heldOn)}` : '';
     gate.className = 'gate ' + (!s2.paused && s2.canAfford && (s2.auto ? s2.autoPairs > 0 : s2.canTrade) ? 'ok' : 'no');
     gate.textContent = s2.paused ? 'Paused · no new trades (signals and learning continue)'
       : !s2.canAfford ? `Not trading: the balance (${balance.toFixed(2)}) can't cover the ${s2.nextStake.toFixed(2)} stake. Lower the amount per trade${s2.sync ? '' : ', or set a higher paper balance'}.`
-      : s2.auto ? (s2.autoPairs ? `Auto · watching ${s2.autoPairs} pair${s2.autoPairs > 1 ? 's' : ''} at ${pct0(s2.minPayout)}+ payout${stake}${autoWhere}${autoOpen}`
+      : s2.auto ? (s2.autoPairs ? `Auto · watching ${s2.autoPairs} pair${s2.autoPairs > 1 ? 's' : ''} at ${pct0(s2.minPayout)}+ payout${provenPairs()}${stake}${autoWhere}${autoOpen}`
                                 : `Auto · no ${isDemo(S.asset) ? 'demo' : 'Pocket Option'} pair is streaming at ${pct0(s2.minPayout)}+ payout${autoOpen}`)
-      : s2.canTrade ? `Payout ${pct0(s2.payout)} · trading${stake}${where}` : `Not trading: ${gateReason()}`;
+      : s2.canTrade ? `Payout ${pct0(s2.payout)} · ${standingAside()}${stake}${where}` : `Not trading: ${gateReason()}`;
     renderMode();
     // Don't overwrite a number while it's being typed; drop-downs always show the live value.
     const keep = (id, v) => { if ($(id).tagName === 'SELECT' || document.activeElement !== $(id)) $(id).value = v; };
-    keep('setMart', String(s2.steps)); keep('setZ', String(s2.z)); keep('setMult', String(s2.mult));
+    keep('setMart', String(s2.steps)); keep('setFreq', s2.frequency || 'custom'); keep('setMult', String(s2.mult));
+    $('freqNote').textContent = FREQ_NOTES[s2.frequency] || `Rules z ${s2.z}, track record z ${s2.trackZ} after ${s2.trackMin} picks.`;
     const pctMode = s2.stakePct > 0;
     keep('setStakeUnit', pctMode ? 'pct' : 'fixed');
     keep('setStake', String(pctMode ? s2.stakePct : s2.stake)); keep('setMode', s2.mode);
     $('setStake').min = pctMode ? '0.1' : '1'; $('setStake').max = pctMode ? '100' : ''; $('setStake').step = pctMode ? '0.1' : '1';
     $('stakeLbl').textContent = pctMode ? `% of balance (${s2.baseAmount.toFixed(2)} now)` : 'Amount per trade';
     keep('setAuto', s2.auto ? '1' : '0'); keep('setAwake', s2.awake);
+    const nList = (s2.autoList || []).length;
+    $('autoPairsBtn').textContent = nList ? `${nList} pair${nList > 1 ? 's' : ''} chosen…` : 'All pairs · choose…';
     keep('setSync', s2.sync ? '1' : '0');
     const poBal = s2.mode === 'real' ? s2.poReal : s2.poDemo, acct = s2.mode === 'real' ? 'real-money' : 'demo';
     keep('setBalance', s2.sync ? (poBal != null ? poBal.toFixed(2) : '') : String(s2.startBalance));
@@ -786,6 +867,20 @@ function renderAccount() {
 }
 
 const pct0 = x => x == null ? '—' : Math.round(x * 100) + '%';
+// What the account does with the next candle, given why the engine is holding.
+function standingAside() {
+  const h = S.signal && S.signal.hold;
+  return h === 'proving' || h === 'unproven' ? 'ready, standing aside until its picks beat break-even'
+    : h === 'no-edge' || h === 'conflict' || h === 'learning' ? 'ready, waiting for a signal' : 'trading';
+}
+// Streaming pairs whose track record on the selected timeframe beats their break-even.
+function provenPairs() {
+  if (!S.training || !S.cfg) return '';
+  const list = (S.status && S.status.autoList) || [];
+  const n = S.training.rows.filter(r => r.tf === S.tf && r.proven && isDemo(r.asset) === isDemo(S.asset) &&
+    (!list.length || list.includes(r.asset)) && isLive(S.assets.find(a => a.name === r.asset))).length;
+  return ` · ${n} with a proven edge on ${tfLabel(S.tf)}`;
+}
 function gateReason() {
   const s2 = S.status;
   if (!s2) return '';
@@ -814,9 +909,40 @@ $('payoutRows').addEventListener('click', e => {
 const setting = (k, v) => fetch('/api/settings', { method: 'POST', body: new URLSearchParams({ [k]: v }) }).catch(() => {});
 $('setMart').addEventListener('change', e => setting('martingale', e.target.value));
 $('setMult').addEventListener('change', e => setting('mult', e.target.value));
-$('setZ').addEventListener('change', e => setting('z', e.target.value));
+$('setFreq').addEventListener('change', e => setting('frequency', e.target.value));
+const FREQ_NOTES = {
+  careful: 'Trades only when its own picks prove an edge with confidence.',
+  balanced: 'Trades once its recent picks beat break-even (20+ picks).',
+  active: 'Also trades rules that only just beat break-even. Most trades with the check on.',
+  unchecked: 'Trades every qualifying rule, as before the track record. Lost the most on your data.',
+};
 $('setAuto').addEventListener('change', e => setting('auto', e.target.value));
 $('setSync').addEventListener('change', e => setting('sync', e.target.value));
+function autoPickRows() {
+  // Currency pairs from Pocket Option's table, best payout first, plus anything else that has prices here.
+  const names = S.market.map(m => m.asset);
+  for (const a of S.assets) if (a.ticks > 0 && !names.includes(a.name) && isDemo(a.name) === isDemo(S.asset)) names.push(a.name);
+  for (const a of (S.status && S.status.autoList) || []) if (!names.includes(a)) names.push(a);
+  return names;
+}
+$('autoPairsBtn').addEventListener('click', () => {
+  const chosen = new Set((S.status && S.status.autoList) || []);
+  $('autoPickList').innerHTML = autoPickRows().map(a => {
+    const m = marketOf(a), live = isLive(S.assets.find(x => x.name === a));
+    return `<label><input type="checkbox" value="${esc(a)}"${chosen.has(a) ? ' checked' : ''}><span class="grow">${esc(m && m.name || pairName(a))}</span>
+      ${live ? '<span class="up">streaming</span>' : ''}<span class="num muted">${m ? pct0(m.payout) : ''}</span></label>`;
+  }).join('') || '<div class="empty" style="padding:12px">Pairs appear once Pocket Option is connected.</div>';
+  $('autoDlg').showModal();
+});
+$('autoPickHigh').addEventListener('click', () => {
+  document.querySelectorAll('#autoPickList input').forEach(c => { const m = marketOf(c.value); c.checked = !!m && m.open && m.payout >= minPayout() - 1e-9; });
+});
+$('autoPickNone').addEventListener('click', () => document.querySelectorAll('#autoPickList input').forEach(c => { c.checked = false; }));
+$('autoPickSave').addEventListener('click', () => {
+  const list = [...document.querySelectorAll('#autoPickList input:checked')].map(c => c.value);
+  setting('autoList', list.join(','));
+  $('autoDlg').close();
+});
 $('setBalance').addEventListener('change', e => { const v = Number(e.target.value); if (v >= 1) setting('balance', v); });
 $('setAwake').addEventListener('change', e => setting('awake', e.target.value));
 $('setStake').addEventListener('change', e => {
@@ -960,7 +1086,7 @@ function renderSession() {
 }
 
 function renderRules() {
-  const z = S.cfg ? S.cfg.z : 1, min = S.cfg ? S.cfg.minSamples : 50;
+  const z = S.status ? S.status.z : S.cfg ? S.cfg.z : 1, min = S.cfg ? S.cfg.minSamples : 50;
   const rows = S.rules.map(r => ({ ...r, recent: r.n > 0 ? r.w / r.n : null, lower: wilson(r.w, r.n, z), all: r.total ? r.wins / r.total : null }))
     .sort((a, b) => (b.recent ?? -1) - (a.recent ?? -1));
   $('rulesRows').innerHTML = rows.length ? rows.map(r => {
@@ -973,7 +1099,7 @@ function renderRules() {
 }
 
 function renderTraining() {
-  const T = S.training, z = S.cfg ? S.cfg.z : 1;
+  const T = S.training, z = S.status ? S.status.z : S.cfg ? S.cfg.z : 1;
   $('trainHead').innerHTML = `<th>Pair</th><th class="r">Payout</th>` + TIMEFRAMES.map(tf => `<th class="r">${tfLabel(tf)}</th>`).join('');
   if (!T || !T.rows.length) {
     $('trainRows').innerHTML = `<tr><td colspan="${TIMEFRAMES.length + 2}" class="empty">Pairs appear here once prices arrive.</td></tr>`;
@@ -992,17 +1118,22 @@ function renderTraining() {
     const cells = TIMEFRAMES.map(tf => {
       const r = byAsset.get(a)[tf];
       if (!r) return `<td class="r muted">—</td>`;
-      const q = r.best && r.best.lower > beA && (p ?? 0) >= minPayout() - 1e-9;
+      const min = trackMin(), t = r.track;
+      const rulesOk = r.best && r.best.lower > beA;
+      const proven = min <= 0 ? rulesOk : !!t && t.n >= min && t.lower > beA;
+      const q = proven && (p ?? 0) >= minPayout() - 1e-9;
       if (q && streaming(a)) ready++;
-      const title = r.best ? `${r.best.rule}: ${pct(r.best.rate)} recent, lower bound ${pct(r.best.lower)} vs break-even ${pct(beA)} (n ${Math.round(r.best.n)})` : 'still learning';
-      return `<td class="r num tcell${q ? ' q' : ''}${a === S.asset && tf === S.tf ? ' sel' : ''}" data-asset="${esc(a)}" data-tf="${tf}" title="${esc(title)}">${fmtN(r.candles)}<span class="muted"> · ${r.best ? pct(r.best.lower) : 'learning'}</span></td>`;
+      const title = !r.best ? 'still learning'
+        : `Bot's own picks: ${t && t.n >= 0.5 ? `${pct(t.rate)} recent, proven ≥ ${pct(t.lower)} over ${t.total} picks` : 'none yet'} vs break-even ${pct(beA)}.\nBest rule: ${r.best.rule}, ${pct(r.best.rate)} recent, lower bound ${pct(r.best.lower)} (n ${Math.round(r.best.n)}).`;
+      const shown = !r.best ? 'learning' : t && t.n >= min ? pct(t.lower) : `proving ${Math.floor(t ? t.n : 0)}/${min}`;
+      return `<td class="r num tcell${q ? ' q' : rulesOk ? ' c' : ''}${a === S.asset && tf === S.tf ? ' sel' : ''}" data-asset="${esc(a)}" data-tf="${tf}" title="${esc(title)}">${fmtN(r.candles)}<span class="muted"> · ${shown}</span></td>`;
     }).join('');
     const tag = isDemo(a) ? ' <span class="muted">simulated, not saved</span>' : streaming(a) ? '' : ' <span class="muted">no live prices</span>';
     return `<tr><td>${esc(pairName(a))}${tag}</td><td class="r num">${p != null ? pct0(p) : '—'}</td>${cells}</tr>`;
   }).join('');
   $('nTraining').textContent = ready || '';
   const saved = T.savedAt ? `Last saved ${ago(T.savedAt)}` : 'Not saved yet';
-  $('trainNote').textContent = `Each cell: candles learned · best rule's lower confidence bound (z ${z}). Green cells beat their pair's break-even and are tradeable; click one to select it. Every pair you have open in Pocket Option learns all six timeframes at once, so open more pairs (extra tabs, or Pocket Option's multi-chart layout) to train them side by side. Training is saved every minute and when the app closes, and picked up on the next start. ${saved}${T.file ? ' · ' + T.file : ''}.`;
+  $('trainNote').textContent = `Each cell: candles learned · how much of the bot's own track record is proven (lower bound, z ${S.status ? S.status.trackZ : 1}). Green cells beat their pair's break-even and are traded. Orange cells have a rule that looks good, but the bot's picks there aren't winning enough, so it stands aside. Click a cell to select it. Every pair you have open in Pocket Option learns all six timeframes at once, so open more pairs (extra tabs, or Pocket Option's multi-chart layout) to train them side by side. Training is saved every minute and when the app closes, and picked up on the next start. ${saved}${T.file ? ' · ' + T.file : ''}.`;
 }
 $('trainRows').addEventListener('click', e => {
   const td = e.target.closest('td.tcell');

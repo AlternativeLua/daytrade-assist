@@ -14,7 +14,7 @@ use std::path::Path;
 
 use crate::candle::{Aggregator, Candle};
 use crate::feed::Tick;
-use crate::strategy::{BASES, EXPERTS, Engine, Params, Record, RuleScore, Signal};
+use crate::strategy::{BASES, EXPERTS, Engine, Params, Record, RuleScore, Signal, Track};
 
 /// Timeframes every pair learns, matching the app's timeframe buttons.
 pub const TIMEFRAMES_MS: [i64; 6] = [15_000, 30_000, 60_000, 120_000, 300_000, 900_000];
@@ -27,6 +27,8 @@ pub struct Saved {
     pub slot: i64,
     pub candles: u64,
     pub records: [Record; EXPERTS],
+    /// The engine's own picks; `None` in training saved before it was kept.
+    pub track: Option<Record>,
 }
 
 /// One pair's rules on one timeframe.
@@ -70,7 +72,7 @@ impl Learner {
     fn merge(&mut self) {
         if let Some(s) = self.pending.take() {
             if s.candles >= self.engine.candles() {
-                self.engine.restore(s.records, s.candles);
+                self.engine.restore(s.records, s.candles, s.track);
             }
         }
     }
@@ -85,6 +87,7 @@ impl Learner {
             slot,
             candles: self.engine.candles(),
             records: *self.engine.records(),
+            track: Some(self.engine.track_record()),
         })
     }
 
@@ -92,13 +95,14 @@ impl Learner {
         self.pending.map_or(self.engine.candles(), |s| s.candles.max(self.engine.candles()))
     }
 
-    /// The best rule so far, counting saved training not merged in yet.
-    pub fn strongest(&self) -> Option<RuleScore> {
+    /// The best rule so far and the engine's own track record, counting
+    /// saved training not merged in yet.
+    pub fn standing(&self) -> (Option<RuleScore>, Track, bool) {
         let mut e = self.engine;
         if let Some(s) = self.pending.filter(|s| s.candles >= e.candles()) {
-            e.restore(s.records, s.candles);
+            e.restore(s.records, s.candles, s.track);
         }
-        e.strongest()
+        (e.strongest(), e.track(), e.proven())
     }
 }
 
@@ -132,7 +136,7 @@ pub fn save(path: &Path, store: &Store) -> io::Result<()> {
     for key in keys {
         let s = &store[key];
         write!(w, "{}\t{}\t{}\t{}", key.0, key.1, s.slot, s.candles)?;
-        for r in &s.records {
+        for r in s.records.iter().chain(&s.track) {
             write!(w, "\t{} {} {} {}", r.recent_wins(), r.weight(), r.wins, r.total)?;
         }
         writeln!(w)?;
@@ -147,7 +151,8 @@ fn header() -> String {
     format!("{HEADER} {}", BASES.join("|"))
 }
 
-/// `asset  period_ms  slot  candles  (w n wins total) × EXPERTS`, tab-separated.
+/// `asset  period_ms  slot  candles  (w n wins total) × EXPERTS  [track]`, tab-separated.
+/// The track record comes last, so training saved before it existed still loads.
 fn parse(line: &str) -> Option<((String, i64), Saved)> {
     let mut f = line.split('\t');
     let asset = f.next().filter(|a| !a.is_empty())?.to_owned();
@@ -156,15 +161,25 @@ fn parse(line: &str) -> Option<((String, i64), Saved)> {
     let candles = f.next()?.parse().ok()?;
     let mut records = [Record::default(); EXPERTS];
     for r in &mut records {
-        let mut v = f.next()?.split(' ');
-        let w: f64 = v.next()?.parse().ok()?;
-        let n: f64 = v.next()?.parse().ok()?;
-        if !(w.is_finite() && n.is_finite() && (0.0..=n).contains(&w)) {
-            return None;
-        }
-        *r = Record::from_parts(w, n, v.next()?.parse().ok()?, v.next()?.parse().ok()?);
+        *r = record(f.next()?)?;
     }
-    f.next().is_none().then_some(((asset, period_ms), Saved { slot, candles, records }))
+    let track = match f.next() {
+        Some(field) => Some(record(field)?),
+        None => None,
+    };
+    f.next().is_none().then_some(((asset, period_ms), Saved { slot, candles, records, track }))
+}
+
+/// `w n wins total`
+fn record(field: &str) -> Option<Record> {
+    let mut v = field.split(' ');
+    let w: f64 = v.next()?.parse().ok()?;
+    let n: f64 = v.next()?.parse().ok()?;
+    if !(w.is_finite() && n.is_finite() && (0.0..=n).contains(&w)) {
+        return None;
+    }
+    let r = Record::from_parts(w, n, v.next()?.parse().ok()?, v.next()?.parse().ok()?);
+    v.next().is_none().then_some(r)
 }
 
 #[cfg(test)]
@@ -252,9 +267,20 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let (a, b) = (&store[&("EURUSD_otc".into(), 15_000)], &back[&("EURUSD_otc".into(), 15_000)]);
         assert_eq!((a.slot, a.candles), (b.slot, b.candles));
-        for (x, y) in a.records.iter().zip(&b.records) {
+        assert!(a.track.unwrap().total > 0);
+        for (x, y) in a.records.iter().chain(&a.track).zip(b.records.iter().chain(&b.track)) {
             assert_eq!((x.recent_wins(), x.weight(), x.wins, x.total), (y.recent_wins(), y.weight(), y.wins, y.total));
         }
+    }
+
+    #[test]
+    fn loads_training_saved_before_the_track_record() {
+        let rule = "\t1 2 1 2".repeat(EXPERTS);
+        let (_, old) = parse(&format!("EURUSD_otc\t60000\t5\t9{rule}")).unwrap();
+        assert!(old.track.is_none());
+        let (_, new) = parse(&format!("EURUSD_otc\t60000\t5\t9{rule}\t3 4 3 4")).unwrap();
+        assert_eq!(new.track.unwrap().total, 4);
+        assert!(parse(&format!("EURUSD_otc\t60000\t5\t9{rule}\t3 4 3 4\t1 1 1 1")).is_none());
     }
 
     #[test]

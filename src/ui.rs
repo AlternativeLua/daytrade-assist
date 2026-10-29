@@ -17,7 +17,7 @@ use crate::feed::{AssetCache, Input, Registry, SettingsChange, Tick, TradeMode, 
 use crate::latency::Histogram;
 use crate::paper::{Outcome, Settlement, Trade};
 use crate::power::Awake;
-use crate::strategy::{EXPERTS, Pick, Record, RuleScore, Side, Signal, expert_name};
+use crate::strategy::{EXPERTS, Frequency, Pick, Record, RuleScore, Side, Signal, Track, expert_name};
 
 const INDEX: &str = include_str!("../ui/index.html");
 const MAX_CANDLES: usize = 3000;
@@ -42,6 +42,7 @@ pub struct UiConfig {
     pub balance: f64,
     pub z: f64,
     pub min_samples: f64,
+    pub track_min: f64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -70,6 +71,10 @@ pub struct TrainingRow {
     pub period_ms: i64,
     pub candles: u64,
     pub best: Option<RuleScore>,
+    /// The engine's own picks on this pair and timeframe.
+    pub track: Track,
+    /// Whether that track record beats break-even, so the pair would be traded.
+    pub proven: bool,
 }
 
 pub enum Event {
@@ -181,12 +186,20 @@ pub struct Status {
     pub steps: u32,
     pub mult: f64,
     pub z: f64,
+    pub track_z: f64,
+    pub track_min: f64,
+    /// The trade frequency level the settings match, if any.
+    pub frequency: Option<Frequency>,
     pub awake: Awake,
     /// Whether the system agreed to stay awake.
     pub awake_ok: bool,
     pub auto: bool,
     /// Pairs auto mode can trade right now: streaming, open and paying enough.
     pub auto_pairs: usize,
+    /// In auto mode, the pair a run of losses is being continued on.
+    pub held_on: Option<String>,
+    /// Pairs auto mode may trade; empty means every pair.
+    pub auto_list: Vec<String>,
     pub balance: f64,
     pub start_balance: f64,
     /// Whether the balance follows the Pocket Option account.
@@ -504,6 +517,7 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
                 martingale_steps: form.get("martingale").and_then(|v| v.parse::<u32>().ok()).filter(|n| *n <= 8),
                 martingale_mult: num("mult").filter(|m| (1.0..=5.0).contains(m)),
                 z: num("z").filter(|z| (0.0..=4.0).contains(z)),
+                frequency: form.get("frequency").and_then(|f| Frequency::parse(f)),
                 stake: num("stake").filter(|s| *s >= 1.0 && *s <= 1_000_000.0),
                 stake_pct: num("stakePct").filter(|p| (0.0..=100.0).contains(p)),
                 mode: match form.get("mode").map(String::as_str) {
@@ -520,6 +534,9 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
                 auto: form.get("auto").map(|v| v == "1"),
                 balance: num("balance").filter(|b| *b >= 1.0 && *b <= 100_000_000.0),
                 sync: form.get("sync").map(|v| v == "1"),
+                auto_list: form.get("autoList").map(|v| {
+                    v.split(',').map(str::trim).filter(|a| !a.is_empty()).take(500).map(str::to_owned).collect()
+                }),
             };
             let _ = shared.input.send(Input::Settings(change));
             respond(&mut stream, "200 OK", "text/plain", "ok")
@@ -1036,10 +1053,12 @@ impl Hub {
                             )
                         });
                         format!(
-                            r#"{{"asset":"{}","tf":{},"candles":{},"best":{best}}}"#,
+                            r#"{{"asset":"{}","tf":{},"candles":{},"best":{best},"track":{},"proven":{}}}"#,
                             escape(&r.asset),
                             r.period_ms / 1000,
-                            r.candles
+                            r.candles,
+                            track_json(&r.track),
+                            r.proven
                         )
                     }),
                 );
@@ -1054,7 +1073,7 @@ impl Hub {
                 let previous = std::mem::take(&mut self.status);
                 self.auto = st.auto;
                 self.status = format!(
-                    r#"{{"mode":"{}","paused":{},"lossLimit":{},"realPnl":{},"stopReason":{},"stake":{},"stakePct":{},"baseAmount":{},"payout":{},"open":{},"canTrade":{},"minPayout":{},"nextStake":{},"canAfford":{},"step":{},"steps":{},"mult":{},"z":{},"awake":"{}","awakeOk":{},"auto":{},"autoPairs":{},"balance":{},"startBalance":{},"sync":{},"poDemo":{},"poReal":{}}}"#,
+                    r#"{{"mode":"{}","paused":{},"lossLimit":{},"realPnl":{},"stopReason":{},"stake":{},"stakePct":{},"baseAmount":{},"payout":{},"open":{},"canTrade":{},"minPayout":{},"nextStake":{},"canAfford":{},"step":{},"steps":{},"mult":{},"z":{},"trackZ":{},"trackMin":{},"frequency":{},"awake":"{}","awakeOk":{},"auto":{},"autoPairs":{},"heldOn":{},"autoList":[{}],"balance":{},"startBalance":{},"sync":{},"poDemo":{},"poReal":{}}}"#,
                     st.mode.name(),
                     st.paused,
                     num(st.loss_limit),
@@ -1073,10 +1092,15 @@ impl Hub {
                     st.steps,
                     num(st.mult),
                     num(st.z),
+                    num(st.track_z),
+                    num(st.track_min),
+                    st.frequency.map_or("null".into(), |f| format!("\"{}\"", f.name())),
                     st.awake.name(),
                     st.awake_ok,
                     st.auto,
                     st.auto_pairs,
+                    st.held_on.as_deref().map_or("null".into(), |a| format!("\"{}\"", escape(a))),
+                    st.auto_list.iter().map(|a| format!("\"{}\"", escape(a))).collect::<Vec<_>>().join(","),
                     num(st.balance),
                     num(st.start_balance),
                     st.sync,
@@ -1140,8 +1164,10 @@ impl Hub {
             )
         });
         format!(
-            r#"{{"time":{},"side":{side},"best":{best},"voting":{},"learning":{},"rsi":{},"z":{}}}"#,
+            r#"{{"time":{},"side":{side},"hold":{},"track":{},"best":{best},"voting":{},"learning":{},"rsi":{},"z":{}}}"#,
             slot * self.period_ms,
+            sig.hold.map_or("null".into(), |h| format!("\"{}\"", h.name())),
+            track_json(&sig.track),
             sig.voting,
             sig.learning.map_or("null".into(), num),
             num(sig.rsi),
@@ -1273,12 +1299,13 @@ impl Hub {
         let opt = |v: &Option<String>| v.as_deref().map_or("null".into(), |p| format!("\"{}\"", escape(p)));
         let _ = write!(
             s,
-            r#"{{"type":"snapshot","config":{{"stake":{},"payout":{},"balance":{},"z":{},"minSamples":{},"journal":{},"extensionDir":{},"firefoxDir":{},"firefoxXpi":{},"session":{}}},"phase":"{}","asset":"{}","tf":{},"assets":{},"bridge":{},"backtest":{},"status":{},"market":{},"orders":{},"diag":{},"candles":["#,
+            r#"{{"type":"snapshot","config":{{"stake":{},"payout":{},"balance":{},"z":{},"minSamples":{},"trackMin":{},"journal":{},"extensionDir":{},"firefoxDir":{},"firefoxXpi":{},"session":{}}},"phase":"{}","asset":"{}","tf":{},"assets":{},"bridge":{},"backtest":{},"status":{},"market":{},"orders":{},"diag":{},"candles":["#,
             num(c.stake),
             num(c.payout),
             num(c.balance),
             num(c.z),
             num(c.min_samples),
+            num(c.track_min),
             opt(&c.journal),
             opt(&c.extension_dir),
             opt(&c.firefox_dir),
@@ -1381,6 +1408,17 @@ fn market_json(mut rows: Vec<MarketRow>) -> String {
     }
     s.push(']');
     s
+}
+
+fn track_json(t: &Track) -> String {
+    format!(
+        r#"{{"rate":{},"lower":{},"n":{},"wins":{},"total":{}}}"#,
+        num(t.rate),
+        num(t.lower),
+        num(t.n),
+        t.wins,
+        t.total
+    )
 }
 
 fn rules_json(records: &[Record; EXPERTS]) -> String {

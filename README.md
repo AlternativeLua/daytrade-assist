@@ -55,7 +55,7 @@ The extension reads socket.io `updateStream` frames (`[["EURUSD_otc", <unix seco
 
 Every pair that sends prices learns all six timeframes at once, whether or not it's the pair on screen. Pocket Option only streams the pairs you have open, so open several (one per tab, or Pocket Option's multi-chart layout) to train them side by side.
 
-The **Training** tab shows each pair and timeframe: candles learned, and the best rule's lower confidence bound. Green cells beat that pair's break-even and are tradeable. Click a cell to select it.
+The **Training** tab shows each pair and timeframe: candles learned, and how much of the bot's own track record there is proven (see *How it decides*). Green cells beat that pair's break-even and are traded. Orange cells have a rule that looks good, but the bot's picks there aren't winning enough, so it stands aside. Click a cell to select it.
 
 What has been learned is saved to `training.txt` every minute, after chart history arrives, and when the app closes. On the next start it is merged with the saved tick logs, so learning carries on from where it stopped, even for history older than the week of ticks the logs keep. Demo pairs are simulated afresh each start, so their training isn't saved.
 
@@ -63,7 +63,9 @@ What has been learned is saved to `training.txt` every minute, after chart histo
 
 **Pairs traded → Auto: any streaming pair** (or `--auto`) trades whichever pair has a qualified signal on the selected timeframe, not just the pair on screen. It trades pairs of the same kind as the selected one: Pocket Option pairs, or demo pairs.
 
+- **Auto pairs → choose…** limits it to the pairs you tick. With none ticked it trades any pair.
 - One trade at a time, taken from the first pair whose candle closes with a signal. So the multiplier after a loss, Pause and the real-money loss limit work as before.
+- After a loss, the multiplied trade stays on the pair that lost, and waits for its next signal. If that pair stops streaming, falls below the minimum payout or is taken off the list, the run carries on with whichever pair signals next.
 - Each pair is held to its own payout: it must pay at least the minimum payout, and its rule must beat that payout's break-even.
 - Orders go to Pocket Option as usual, through the tab streaming that pair.
 - Switching the chart doesn't reset the auto account or close its trade.
@@ -126,14 +128,16 @@ What multiplying does and doesn't do (6 simulated runs × 20,000 candles each, $
 
 Doubling never changes the win rate, and it barely changes the return per dollar staked. What it does is stake more after losses, which multiplies the drawdowns about 5 times. At an 85% payout, a win only recovers the earlier losses if it comes within 2 losses. Five losses in a row cost 31× the base stake.
 
-**Selectivity** (`--z`, *Selectivity* in the app) trades off how often it signals against how sure it is:
+**Trade frequency** (*Trade frequency* in the app, remembered between sessions) sets how sure the bot must be before it trades. It sets the rules' confidence (`--z`) and the track record check (`--track-z`, `--track-min`, see *How it decides*) together:
 
-| weak-edge feed | candles traded | win rate |
-|---|---|---|
-| Loose | 86% | 55.0% |
-| Normal (default) | 51% | 55.4% |
-| Strict | 29% | 56.0% |
-| Very strict | 12% | 56.5% |
+| level | rules | track record | 1m on the saved Pocket Option ticks ($10, 88%) |
+|---|---|---|---|
+| Careful (default) | lower bound beats break-even | lower bound beats break-even, 40+ picks | 0.7% of candles, 43.8% won, −$1.77 a trade |
+| Balanced | lower bound | win rate beats break-even, 20+ picks | 5.9% of candles, 51.2% won, −$0.38 a trade |
+| Active | win rate beats break-even | win rate, 20+ picks | 15% of candles, 52.2% won, −$0.18 a trade |
+| No track record check | lower bound | — | 16% of candles, 49.5% won, −$0.69 a trade |
+
+On 15s and 2m Careful made no trades, and every looser level lost money there. On 30s Balanced came closest, at −$0.07 a trade. These figures rest on few trades, so they're noisy, and no level reached break-even on these feeds.
 
 ## How it decides
 
@@ -142,21 +146,35 @@ OTC prices come from each broker's own price generator, and the generators aren'
 1. Each closed candle feeds 12 base signals: last candle colour, 3-candle streak, the move in the last sixth of the candle, RSI(2), RSI(14), Bollinger ±2σ and ±1σ, stochastic(5,3), EMA 9/21 trend, wick rejection, trend pullback, and where the close sits in the candle's range.
 2. Each base signal is a pair of rules: **follow** (trade in its direction) and **fade** (trade against it), 24 rules in total. The feed decides which direction works.
 3. Every vote from every rule is scored against the next candle, whether it was traded or not. Recent votes count more (`--half-life`, 400 votes by default).
-4. A rule is only traded while the lower confidence bound of its win rate (Wilson, `--z`) is above the pair's break-even rate at its current payout (54.1% at 85%, 52.1% at 92%).
+4. A rule only qualifies while the lower confidence bound of its win rate (Wilson, `--z`) is above the pair's break-even rate at its current payout (54.1% at 85%, 52.1% at 92%).
+5. **Track record.** The best of 24 rules always looks better than it is, because whichever rule got lucky lately rises to the top. On a feed with no lasting pattern that is usually a trend-follower riding the last move, so the bot would jump on a trend just as it ran out. To catch this, the bot scores its own picks on the next candle, traded or not, with a shorter memory (`--track-half-life`, 300 picks). That record is out of sample, because each pick is made before its candle is known. A qualifying rule is only traded once the bot has made at least 40 picks (`--track-min`) and the lower bound of their win rate is above break-even. When a trend breaks or the market turns choppy, the record drops and the bot stands aside. It resumes by itself when its picks win again. `--track-min 0` turns this off.
 
 Each pair and timeframe is learned separately. The decision takes about 250 ns. Logging, the UI and the bridge all run on other threads, after the decision is made.
 
 ### Calibration (simulated, 6 seeds × 20,000 candles, z = 1, fixed stake)
 
-| feed | candles traded | win rate | per $1 staked |
-|---|---|---|---|
-| random walk (no edge) | 0.4% | 44% | −0.18 |
-| weak reversal (true ≈53%, below break-even) | 10% | 53.4% | −0.01 |
-| reversal 0.2 (true ≈56%) | 80% | 56.8% | +0.051 |
-| reversal 0.3 (true ≈60%) | 98% | 59.9% | +0.107 |
-| momentum 0.2 | 81% | 56.9% | +0.052 |
+| feed | candles traded | win rate | per $1 staked | without the track record |
+|---|---|---|---|---|
+| random walk (no edge) | 0% | — | 0 | 0.4% traded, −0.18 |
+| weak reversal (true ≈53%, below break-even) | 0.3% | 50.6% | −0.06 | 10.5% traded, −0.013 |
+| reversal 0.2 (true ≈56%) | 46% | 56.4% | +0.044 | 80% traded, +0.051 |
+| reversal 0.3 (true ≈60%) | 94% | 59.9% | +0.108 | 98% traded, +0.107 |
+| momentum 0.2 | 49% | 56.6% | +0.048 | 81% traded, +0.052 |
 
-On a feed with a pattern, it trades most candles. On noise it mostly holds, and the few noise trades it does take lose. Lower `--z` (e.g. 0 or 0.5) for more signals at the cost of more noise trades.
+On noise and on edges too small to pay, it now almost never trades. On a strong pattern it trades nearly every candle. The cost is a marginal edge (56%): it trades about half as often there, because its own record takes longer to prove itself. Lower `--z` (e.g. 0 or 0.5) for more signals at the cost of more noise trades.
+
+### What the real Pocket Option data showed (October 2026)
+
+Replaying the saved tick logs (8 OTC pairs, about 7,000 one-minute candles) through the app, with a fixed $10 stake at an 88% payout:
+
+| timeframe | without the track record | with it |
+|---|---|---|
+| 15s | 1,496 trades, 50.9% won, −$634 | no trades |
+| 30s | 746 trades, 48.9% won, −$598 | 73 trades, 47.9% won, −$72 |
+| 1m | 709 trades, 49.6% won, −$472 | 32 trades, 43.8% won, −$57 |
+| 2m | 409 trades, 48.9% won, −$330 | no trades |
+
+The 568 trades the app had already placed on these pairs won 48.6%. Their rules had claimed recent win rates of 56–62%, and the rules claiming 60% or more won only 45%. None of the 12 base signals predicted the next candle better than about 51% on any timeframe, and neither did streaks or trend strength. So far these OTC feeds behave like a coin flip, and the right decision has mostly been not to trade. The track record exists so that the bot reaches that conclusion by itself, and starts trading again if a pattern shows up.
 
 Whether a real OTC feed has any pattern is an open question, and the answer can differ by broker, pair, timeframe and day. Paper trade for a few thousand candles before trusting anything, and don't read much into fewer than a few hundred trades.
 
